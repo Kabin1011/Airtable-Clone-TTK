@@ -1,0 +1,220 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+    provider = "prisma-client-js"
+    output   = "../generated/prisma"
+}
+
+datasource db {
+    provider = "postgresql"
+    url      = env("DATABASE_URL")
+}
+
+// Base represents a workspace/database (like an Airtable Base)
+model Base {
+    id          String   @id @default(cuid())
+    name        String
+    description String?
+    icon        String?  @default("📊")
+    createdAt   DateTime @default(now())
+    updatedAt   DateTime @updatedAt
+
+    // Relations
+    tables Table[]
+
+    @@index([name])
+}
+
+// Table represents a table within a Base (like an Airtable Table)
+model Table {
+    id          String   @id @default(cuid())
+    name        String
+    description String?
+    icon        String?  @default("📋")
+    order       Int      @default(0)
+    createdAt   DateTime @default(now())
+    updatedAt   DateTime @updatedAt
+
+    // Foreign Keys
+    baseId String
+    base   Base   @relation(fields: [baseId], references: [id], onDelete: Cascade)
+
+    // Relations
+    fields  Field[]
+    records Record[]
+    views   View[]
+
+    @@index([baseId])
+    @@index([name])
+}
+
+// Field represents a column in a table
+model Field {
+    id          String    @id @default(cuid())
+    name        String
+    type        FieldType @default(TEXT)
+    order       Int       @default(0)
+    description String?
+
+    // Field configuration stored as JSON (for field-specific options)
+    // Examples: { precision: 2 } for numbers, { format: "YYYY-MM-DD" } for dates
+    config      Json?
+
+    isPrimary   Boolean   @default(false)
+    isRequired  Boolean   @default(false)
+    createdAt   DateTime  @default(now())
+    updatedAt   DateTime  @updatedAt
+
+    // Foreign Keys
+    tableId String
+    table   Table  @relation(fields: [tableId], references: [id], onDelete: Cascade)
+
+    // Relations
+    cells Cell[]
+
+    @@index([tableId])
+    @@index([tableId, order])
+}
+
+// Enum for field types
+enum FieldType {
+    TEXT
+    NUMBER
+    DATE
+    CHECKBOX
+    SELECT
+    MULTI_SELECT
+    URL
+    EMAIL
+    PHONE
+    ATTACHMENT
+    LONG_TEXT
+}
+
+// Record represents a row in a table
+model Record {
+    id        String   @id @default(cuid())
+    order     Int      @default(autoincrement())
+    createdAt DateTime @default(now())
+    updatedAt DateTime @updatedAt
+
+    // Foreign Keys
+    tableId String
+    table   Table  @relation(fields: [tableId], references: [id], onDelete: Cascade)
+
+    // Relations
+    cells Cell[]
+
+    @@index([tableId])
+    @@index([tableId, order])
+}
+
+// Cell represents a single cell value (intersection of field and record)
+model Cell {
+    id String @id @default(cuid())
+
+    // Store value as JSON to support any field type
+    // Examples: "hello", 123, true, ["option1", "option2"], { url: "...", name: "..." }
+    value Json?
+
+    createdAt DateTime @default(now())
+    updatedAt DateTime @updatedAt
+
+    // Foreign Keys
+    fieldId  String
+    recordId String
+    field    Field  @relation(fields: [fieldId], references: [id], onDelete: Cascade)
+    record   Record @relation(fields: [recordId], references: [id], onDelete: Cascade)
+
+    // Unique constraint: one cell per field-record combination
+    @@unique([fieldId, recordId])
+    @@index([recordId])
+    @@index([fieldId])
+}
+
+// View represents a saved view configuration of a table
+model View {
+    id          String   @id @default(cuid())
+    name        String
+    description String?
+    order       Int      @default(0)
+    isDefault   Boolean  @default(false)
+    createdAt   DateTime @default(now())
+    updatedAt   DateTime @updatedAt
+
+    // Foreign Keys
+    tableId String
+    table   Table  @relation(fields: [tableId], references: [id], onDelete: Cascade)
+
+    // Relations
+    filters       Filter[]
+    sorts         Sort[]
+    hiddenFields  HiddenField[]
+
+    @@index([tableId])
+}
+
+// Filter represents a filter condition in a view
+model Filter {
+    id       String         @id @default(cuid())
+    fieldId  String         // Which field to filter on
+    operator FilterOperator
+    value    Json?          // Filter value (can be string, number, array, etc.)
+    order    Int            @default(0)
+
+    // Foreign Keys
+    viewId String
+    view   View   @relation(fields: [viewId], references: [id], onDelete: Cascade)
+
+    @@index([viewId])
+    @@index([viewId, order])
+}
+
+// Enum for filter operators
+enum FilterOperator {
+    EQUALS
+    NOT_EQUALS
+    CONTAINS
+    NOT_CONTAINS
+    IS_EMPTY
+    IS_NOT_EMPTY
+    GREATER_THAN
+    LESS_THAN
+    GREATER_THAN_OR_EQUAL
+    LESS_THAN_OR_EQUAL
+}
+
+// Sort represents a sort configuration in a view
+model Sort {
+    id        String        @id @default(cuid())
+    fieldId   String        // Which field to sort by
+    direction SortDirection
+    order     Int           @default(0) // Sort priority (first sort, second sort, etc.)
+
+    // Foreign Keys
+    viewId String
+    view   View   @relation(fields: [viewId], references: [id], onDelete: Cascade)
+
+    @@index([viewId])
+    @@index([viewId, order])
+}
+
+// Enum for sort direction
+enum SortDirection {
+    ASC  // A->Z for text, 0->9 for numbers
+    DESC // Z->A for text, 9->0 for numbers
+}
+
+// HiddenField represents a hidden column in a view
+model HiddenField {
+    id      String @id @default(cuid())
+    fieldId String // Which field is hidden
+
+    // Foreign Keys
+    viewId String
+    view   View   @relation(fields: [viewId], references: [id], onDelete: Cascade)
+
+    @@unique([viewId, fieldId])
+    @@index([viewId])
+}

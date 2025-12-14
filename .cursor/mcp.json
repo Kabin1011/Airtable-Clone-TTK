@@ -1,0 +1,16 @@
+// .cursor/mcp.json
+{
+    "mcpServers": {
+      "supabase-postgres": {
+        "command": "npx",
+        "args": [
+          "-y",
+          "@modelcontextprotocol/server-postgres",
+          "${env:SUPABASE_DB_URL}" // Uses the variable from your .env file
+        ],
+        "env": {
+          "SUPABASE_DB_URL": "${env:SUPABASE_DB_URL}"
+        }
+      }
+    }
+  }
