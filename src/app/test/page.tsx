@@ -8,22 +8,57 @@ export default function TestPage() {
   const [tableId, setTableId] = useState("");
 
   // Test Base API
+  const utils = api.useUtils();
   const { data: bases } = api.base.getAll.useQuery();
-  const createBase = api.base.create.useMutation();
+  const createBase = api.base.create.useMutation({
+    onSuccess: async () => {
+      await utils.base.getAll.invalidate();
+    },
+  });
 
   // Test Table API
   const { data: tables } = api.table.getByBaseId.useQuery(
     { baseId },
     { enabled: !!baseId }
   );
-  const createTable = api.table.create.useMutation();
+  const createTable = api.table.create.useMutation({
+    onSuccess: async () => {
+      await utils.table.getByBaseId.invalidate({ baseId });
+    },
+  });
 
   // Test Field API
   const { data: fields } = api.field.getByTableId.useQuery(
     { tableId },
     { enabled: !!tableId }
   );
-  const createField = api.field.create.useMutation();
+  const createField = api.field.create.useMutation({
+    onSuccess: async () => {
+      await utils.field.getByTableId.invalidate({ tableId });
+    },
+  });
+
+  // Test Record API
+  const { data: recordsData } = api.record.getByTableId.useQuery(
+    { tableId, limit: 10 },
+    { enabled: !!tableId }
+  );
+  const { data: totalCount } = api.record.count.useQuery(
+    { tableId },
+    { enabled: !!tableId }
+  );
+  const createRecord = api.record.create.useMutation({
+    onSuccess: async () => {
+      await utils.record.getByTableId.invalidate({ tableId });
+      await utils.record.count.invalidate({ tableId });
+    },
+  });
+  const bulkCreateRecords = api.record.bulkCreate.useMutation({
+    onSuccess: async () => {
+      await utils.record.getByTableId.invalidate({ tableId });
+      await utils.record.count.invalidate({ tableId });
+    },
+  });
 
   return (
     <div className="min-h-screen bg-gray-900 p-8 text-white">
@@ -121,6 +156,58 @@ export default function TestPage() {
                 Order: {field.order} | {field.name} ({field.type})
               </div>
             ))}
+          </div>
+        </section>
+      )}
+
+      {/* Test Record CRUD */}
+      {tableId && (
+        <section className="mb-8 rounded-lg bg-gray-800 p-6">
+          <h2 className="mb-4 text-2xl font-bold">Records (Rows) in Selected Table</h2>
+          <div className="mb-4 space-x-2">
+            <button
+              onClick={() => createRecord.mutate({ tableId })}
+              className="rounded bg-orange-600 px-4 py-2 hover:bg-orange-700"
+            >
+              Create 1 Row
+            </button>
+            <button
+              onClick={() => bulkCreateRecords.mutate({ tableId, count: 10 })}
+              className="rounded bg-orange-600 px-4 py-2 hover:bg-orange-700"
+            >
+              Create 10 Rows
+            </button>
+            <button
+              onClick={() => bulkCreateRecords.mutate({ tableId, count: 100 })}
+              className="rounded bg-orange-600 px-4 py-2 hover:bg-orange-700"
+            >
+              Create 100 Rows
+            </button>
+            <button
+              onClick={() => bulkCreateRecords.mutate({ tableId, count: 1000 })}
+              className="rounded bg-red-600 px-4 py-2 hover:bg-red-700"
+            >
+              Create 1,000 Rows 🔥
+            </button>
+          </div>
+          <div className="space-y-2">
+            <p className="text-lg font-bold text-green-400">
+              Total Records in Database: {totalCount ?? 0}
+            </p>
+            <p className="text-sm text-gray-400">
+              Showing: {recordsData?.items.length || 0} of {totalCount ?? 0}
+              {recordsData?.nextCursor && " (More available - pagination working!)"}
+            </p>
+            {recordsData?.items.slice(0, 5).map((record) => (
+              <div key={record.id} className="rounded bg-gray-700 p-3 text-sm">
+                Order: {record.order} | ID: {record.id.slice(0, 8)}... | Cells: {record.cells.length}
+              </div>
+            ))}
+            {recordsData && recordsData.items.length > 5 && (
+              <p className="text-sm text-gray-500">
+                ... and {recordsData.items.length - 5} more records
+              </p>
+            )}
           </div>
         </section>
       )}

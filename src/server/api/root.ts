@@ -1,6 +1,7 @@
 import { tableRouter } from "~/server/api/routers/table";
 import { baseRouter } from "~/server/api/routers/base";
 import { fieldRouter } from "~/server/api/routers/field";
+import { recordRouter } from "~/server/api/routers/record";
 import { createCallerFactory, createTRPCRouter } from "~/server/api/trpc";
 
 /**
@@ -12,6 +13,7 @@ export const appRouter = createTRPCRouter({
   table: tableRouter,
   base: baseRouter,
   field: fieldRouter,
+  record: recordRouter,
 });
 
 // export type definition of API
