@@ -60,6 +60,18 @@ export default function TestPage() {
     },
   });
 
+  // Test Cell API
+  const updateCell = api.cell.update.useMutation({
+    onSuccess: async () => {
+      await utils.record.getByTableId.invalidate({ tableId });
+    },
+  });
+  const bulkUpdateCells = api.cell.bulkUpdate.useMutation({
+    onSuccess: async () => {
+      await utils.record.getByTableId.invalidate({ tableId });
+    },
+  });
+
   return (
     <div className="min-h-screen bg-gray-900 p-8 text-white">
       <h1 className="mb-8 text-4xl font-bold">API Test Page</h1>
@@ -160,6 +172,65 @@ export default function TestPage() {
         </section>
       )}
 
+      {/* Test Cell CRUD */}
+      {tableId && fields && fields.length > 0 && recordsData && recordsData.items.length > 0 && (
+        <section className="mb-8 rounded-lg bg-gray-800 p-6">
+          <h2 className="mb-4 text-2xl font-bold">Cell Updates (Test Editing)</h2>
+          <p className="mb-4 text-sm text-gray-400">
+            This tests the upsert pattern - it will create cells if they don't exist, or update them if they do.
+          </p>
+          <div className="mb-4 space-x-2">
+            <button
+              onClick={() => {
+                const firstField = fields[0];
+                const firstRecord = recordsData.items[0];
+                if (firstField && firstRecord) {
+                  updateCell.mutate({
+                    fieldId: firstField.id,
+                    recordId: firstRecord.id,
+                    value: `Updated at ${new Date().toLocaleTimeString()}`,
+                  });
+                }
+              }}
+              className="rounded bg-yellow-600 px-4 py-2 hover:bg-yellow-700"
+              disabled={updateCell.isPending}
+            >
+              {updateCell.isPending ? "Updating..." : "Update First Cell"}
+            </button>
+            <button
+              onClick={() => {
+                const updates = [];
+                for (let i = 0; i < Math.min(5, recordsData.items.length); i++) {
+                  for (let j = 0; j < Math.min(3, fields.length); j++) {
+                    updates.push({
+                      fieldId: fields[j]!.id,
+                      recordId: recordsData.items[i]!.id,
+                      value: `Bulk ${i}-${j} at ${new Date().toLocaleTimeString()}`,
+                    });
+                  }
+                }
+                bulkUpdateCells.mutate({ updates });
+              }}
+              className="rounded bg-yellow-600 px-4 py-2 hover:bg-yellow-700"
+              disabled={bulkUpdateCells.isPending}
+            >
+              {bulkUpdateCells.isPending ? "Updating..." : "Bulk Update 15 Cells"}
+            </button>
+          </div>
+          {updateCell.isSuccess && (
+            <p className="text-sm text-green-400">Single cell updated successfully!</p>
+          )}
+          {bulkUpdateCells.isSuccess && (
+            <p className="text-sm text-green-400">Bulk cells updated successfully!</p>
+          )}
+          {(updateCell.error || bulkUpdateCells.error) && (
+            <p className="text-sm text-red-400">
+              Error: {updateCell.error?.message || bulkUpdateCells.error?.message}
+            </p>
+          )}
+        </section>
+      )}
+
       {/* Test Record CRUD */}
       {tableId && (
         <section className="mb-8 rounded-lg bg-gray-800 p-6">
@@ -200,7 +271,18 @@ export default function TestPage() {
             </p>
             {recordsData?.items.slice(0, 5).map((record) => (
               <div key={record.id} className="rounded bg-gray-700 p-3 text-sm">
-                Order: {record.order} | ID: {record.id.slice(0, 8)}... | Cells: {record.cells.length}
+                <div className="font-bold">
+                  Order: {record.order} | ID: {record.id.slice(0, 8)}... | Cells: {record.cells.length}
+                </div>
+                {record.cells.length > 0 && (
+                  <div className="mt-2 space-y-1 pl-4 text-xs text-gray-300">
+                    {record.cells.map((cell) => (
+                      <div key={cell.id}>
+                        {cell.field.name}: {JSON.stringify(cell.value)}
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
             ))}
             {recordsData && recordsData.items.length > 5 && (
