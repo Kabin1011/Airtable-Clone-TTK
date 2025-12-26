@@ -72,7 +72,9 @@ model Field {
     table   Table  @relation(fields: [tableId], references: [id], onDelete: Cascade)
 
     // Relations
-    cells Cell[]
+    cells   Cell[]
+    filters Filter[]
+    sorts   Sort[]
 
     @@index([tableId])
     @@index([tableId, order])
@@ -167,6 +169,7 @@ model Filter {
     // Foreign Keys
     viewId String
     view   View   @relation(fields: [viewId], references: [id], onDelete: Cascade)
+    field  Field  @relation(fields: [fieldId], references: [id], onDelete: Cascade)
 
     @@index([viewId])
     @@index([viewId, order])
@@ -196,6 +199,7 @@ model Sort {
     // Foreign Keys
     viewId String
     view   View   @relation(fields: [viewId], references: [id], onDelete: Cascade)
+    field  Field  @relation(fields: [fieldId], references: [id], onDelete: Cascade)
 
     @@index([viewId])
     @@index([viewId, order])

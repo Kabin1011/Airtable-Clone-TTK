@@ -44,25 +44,34 @@ export const cellRouter = createTRPCRouter({
       }),
     )
     .mutation(async ({ ctx, input }) => {
-      // Execute all upserts in parallel
-      return Promise.all(
-        input.updates.map((update) =>
-          ctx.db.cell.upsert({
-            where: {
-              fieldId_recordId: {
+      // Process in batches to avoid overwhelming the connection pool
+      const BATCH_SIZE = 10;
+      const results = [];
+
+      for (let i = 0; i < input.updates.length; i += BATCH_SIZE) {
+        const batch = input.updates.slice(i, i + BATCH_SIZE);
+        const batchResults = await Promise.all(
+          batch.map((update) =>
+            ctx.db.cell.upsert({
+              where: {
+                fieldId_recordId: {
+                  fieldId: update.fieldId,
+                  recordId: update.recordId,
+                },
+              },
+              update: { value: update.value },
+              create: {
                 fieldId: update.fieldId,
                 recordId: update.recordId,
+                value: update.value,
               },
-            },
-            update: { value: update.value },
-            create: {
-              fieldId: update.fieldId,
-              recordId: update.recordId,
-              value: update.value,
-            },
-          }),
-        ),
-      );
+            }),
+          ),
+        );
+        results.push(...batchResults);
+      }
+
+      return results;
     }),
 
   // Delete a cell

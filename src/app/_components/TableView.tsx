@@ -9,7 +9,7 @@ import {
   flexRender,
   type ColumnDef,
 } from "@tanstack/react-table";
-import type { Field, Record as PrismaRecord, Cell } from "@prisma/client";
+import type { Field, Record as PrismaRecord, Cell } from "../../../generated/prisma";
 
 type RecordWithCells = PrismaRecord & {
   cells: (Cell & { field: Field })[];
@@ -25,10 +25,24 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
   const { data: base } = api.base.getById.useQuery({ id: baseId });
   const { data: table } = api.table.getById.useQuery({ id: tableId });
   const { data: fields } = api.field.getByTableId.useQuery({ tableId });
-  const { data: recordsData } = api.record.getByTableId.useQuery({
-    tableId,
-    limit: 50,
-  });
+
+  // Use infinite query for pagination
+  const {
+    data: infiniteData,
+    fetchNextPage,
+    hasNextPage,
+    isFetchingNextPage,
+  } = api.record.getByTableId.useInfiniteQuery(
+    { tableId, limit: 50 },
+    {
+      getNextPageParam: (lastPage) => lastPage.nextCursor,
+    }
+  );
+
+  // Flatten all pages into a single array
+  const records = useMemo(() => {
+    return infiniteData?.pages.flatMap((page) => page.items) ?? [];
+  }, [infiniteData]);
 
   const createField = api.field.create.useMutation({
     onSuccess: async () => {
@@ -117,7 +131,7 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
   }, [fields, updateCell]);
 
   const reactTable = useReactTable({
-    data: recordsData?.items ?? [],
+    data: records,
     columns,
     getCoreRowModel: getCoreRowModel(),
   });
@@ -154,20 +168,26 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
 
       {/* Toolbar */}
       <div className="border-b border-gray-200 bg-white px-6 py-2">
-        <div className="flex items-center gap-2">
-          <button
-            onClick={() => createRecord.mutate({ tableId })}
-            disabled={createRecord.isPending}
-            className="rounded px-3 py-1.5 text-sm font-medium text-gray-700 hover:bg-gray-100"
-          >
-            + Add row
-          </button>
-          <button
-            onClick={() => setIsCreatingField(true)}
-            className="rounded px-3 py-1.5 text-sm font-medium text-gray-700 hover:bg-gray-100"
-          >
-            + Add field
-          </button>
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => createRecord.mutate({ tableId })}
+              disabled={createRecord.isPending}
+              className="rounded px-3 py-1.5 text-sm font-medium text-gray-700 hover:bg-gray-100"
+            >
+              + Add row
+            </button>
+            <button
+              onClick={() => setIsCreatingField(true)}
+              className="rounded px-3 py-1.5 text-sm font-medium text-gray-700 hover:bg-gray-100"
+            >
+              + Add field
+            </button>
+          </div>
+          <div className="text-sm text-gray-600">
+            Showing {records.length} rows
+            {hasNextPage && <span className="ml-2 text-gray-400">(more available)</span>}
+          </div>
         </div>
       </div>
 
@@ -215,6 +235,19 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
             </tbody>
           </table>
         </div>
+
+        {/* Load More Button */}
+        {hasNextPage && (
+          <div className="border-t border-gray-200 bg-gray-50 p-4 text-center">
+            <button
+              onClick={() => fetchNextPage()}
+              disabled={isFetchingNextPage}
+              className="rounded-lg bg-blue-600 px-6 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50"
+            >
+              {isFetchingNextPage ? "Loading..." : "Load More Rows"}
+            </button>
+          </div>
+        )}
       </div>
 
       {/* Create Field Modal */}

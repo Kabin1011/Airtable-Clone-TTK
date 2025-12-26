@@ -72,6 +72,55 @@ export default function TestPage() {
     },
   });
 
+  // Test View API
+  const [viewId, setViewId] = useState("");
+  const { data: views } = api.view.getByTableId.useQuery(
+    { tableId },
+    { enabled: !!tableId }
+  );
+  const createView = api.view.create.useMutation({
+    onSuccess: async () => {
+      await utils.view.getByTableId.invalidate({ tableId });
+    },
+  });
+  const deleteView = api.view.delete.useMutation({
+    onSuccess: async () => {
+      await utils.view.getByTableId.invalidate({ tableId });
+    },
+  });
+
+  // Test Filter API
+  const { data: filters } = api.filter.getByViewId.useQuery(
+    { viewId },
+    { enabled: !!viewId }
+  );
+  const createFilter = api.filter.create.useMutation({
+    onSuccess: async () => {
+      await utils.filter.getByViewId.invalidate({ viewId });
+    },
+  });
+  const deleteFilter = api.filter.delete.useMutation({
+    onSuccess: async () => {
+      await utils.filter.getByViewId.invalidate({ viewId });
+    },
+  });
+
+  // Test Sort API
+  const { data: sorts } = api.sort.getByViewId.useQuery(
+    { viewId },
+    { enabled: !!viewId }
+  );
+  const createSort = api.sort.create.useMutation({
+    onSuccess: async () => {
+      await utils.sort.getByViewId.invalidate({ viewId });
+    },
+  });
+  const deleteSort = api.sort.delete.useMutation({
+    onSuccess: async () => {
+      await utils.sort.getByViewId.invalidate({ viewId });
+    },
+  });
+
   return (
     <div className="min-h-screen bg-gray-900 p-8 text-white">
       <h1 className="mb-8 text-4xl font-bold">API Test Page</h1>
@@ -214,7 +263,27 @@ export default function TestPage() {
               className="rounded bg-yellow-600 px-4 py-2 hover:bg-yellow-700"
               disabled={bulkUpdateCells.isPending}
             >
-              {bulkUpdateCells.isPending ? "Updating..." : "Bulk Update 15 Cells"}
+              {bulkUpdateCells.isPending ? "Updating..." : "Bulk Update 15 Cells (5 rows × 3 fields)"}
+            </button>
+            <button
+              onClick={() => {
+                const updates = [];
+                // Update all visible records × all fields
+                for (let i = 0; i < recordsData.items.length; i++) {
+                  for (let j = 0; j < fields.length; j++) {
+                    updates.push({
+                      fieldId: fields[j]!.id,
+                      recordId: recordsData.items[i]!.id,
+                      value: `All ${i}-${j} at ${new Date().toLocaleTimeString()}`,
+                    });
+                  }
+                }
+                bulkUpdateCells.mutate({ updates });
+              }}
+              className="rounded bg-purple-600 px-4 py-2 hover:bg-purple-700"
+              disabled={bulkUpdateCells.isPending}
+            >
+              {bulkUpdateCells.isPending ? "Updating..." : `Bulk Update ALL Visible (${recordsData.items.length} rows × ${fields.length} fields = ${recordsData.items.length * fields.length} cells)`}
             </button>
           </div>
           {updateCell.isSuccess && (
@@ -291,6 +360,199 @@ export default function TestPage() {
               </p>
             )}
           </div>
+        </section>
+      )}
+
+      {/* Test View CRUD */}
+      {tableId && (
+        <section className="mb-8 rounded-lg bg-gray-800 p-6">
+          <h2 className="mb-4 text-2xl font-bold">Views for Selected Table</h2>
+          <div className="mb-4 space-x-2">
+            <button
+              onClick={() =>
+                createView.mutate({
+                  tableId,
+                  name: `Test View ${Date.now()}`,
+                })
+              }
+              className="rounded bg-indigo-600 px-4 py-2 hover:bg-indigo-700"
+              disabled={createView.isPending}
+            >
+              {createView.isPending ? "Creating..." : "Create View"}
+            </button>
+          </div>
+          {views && views.length > 0 ? (
+            <div className="space-y-2">
+              {views.map((view) => (
+                <div
+                  key={view.id}
+                  className="flex items-center justify-between rounded bg-gray-700 p-3 text-sm"
+                >
+                  <div>
+                    <span className="font-bold">{view.name}</span>
+                    <span className="ml-2 text-xs text-gray-500">
+                      Filters: {view.filters.length} | Sorts: {view.sorts.length}
+                    </span>
+                  </div>
+                  <div className="space-x-2">
+                    <button
+                      onClick={() => setViewId(view.id)}
+                      className={`rounded px-3 py-1 ${
+                        viewId === view.id
+                          ? "bg-blue-600"
+                          : "bg-gray-600 hover:bg-gray-500"
+                      }`}
+                    >
+                      {viewId === view.id ? "Selected" : "Select"}
+                    </button>
+                    <button
+                      onClick={() => deleteView.mutate({ id: view.id })}
+                      className="rounded bg-red-600 px-3 py-1 hover:bg-red-700"
+                      disabled={deleteView.isPending}
+                    >
+                      Delete
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="text-gray-400">No views yet. Create one to test!</p>
+          )}
+        </section>
+      )}
+
+      {/* Test Filter CRUD */}
+      {viewId && fields && fields.length > 0 && (
+        <section className="mb-8 rounded-lg bg-gray-800 p-6">
+          <h2 className="mb-4 text-2xl font-bold">Filters for Selected View</h2>
+          <div className="mb-4 space-x-2">
+            <button
+              onClick={() => {
+                const firstField = fields[0];
+                if (firstField) {
+                  createFilter.mutate({
+                    viewId,
+                    fieldId: firstField.id,
+                    operator: "CONTAINS",
+                    value: "test",
+                  });
+                }
+              }}
+              className="rounded bg-pink-600 px-4 py-2 hover:bg-pink-700"
+              disabled={createFilter.isPending || !fields[0]}
+            >
+              {createFilter.isPending ? "Creating..." : "Create Filter (CONTAINS 'test')"}
+            </button>
+            <button
+              onClick={() => {
+                const firstField = fields[0];
+                if (firstField) {
+                  createFilter.mutate({
+                    viewId,
+                    fieldId: firstField.id,
+                    operator: "IS_NOT_EMPTY",
+                  });
+                }
+              }}
+              className="rounded bg-pink-600 px-4 py-2 hover:bg-pink-700"
+              disabled={createFilter.isPending || !fields[0]}
+            >
+              {createFilter.isPending ? "Creating..." : "Create Filter (IS_NOT_EMPTY)"}
+            </button>
+          </div>
+          {filters && filters.length > 0 ? (
+            <div className="space-y-2">
+              {filters.map((filter) => (
+                <div
+                  key={filter.id}
+                  className="flex items-center justify-between rounded bg-gray-700 p-3 text-sm"
+                >
+                  <div>
+                    <span className="font-bold">{filter.field.name}</span>
+                    <span className="ml-2 text-gray-400">{filter.operator}</span>
+                    {filter.value && (
+                      <span className="ml-2 text-gray-300">&quot;{filter.value}&quot;</span>
+                    )}
+                  </div>
+                  <button
+                    onClick={() => deleteFilter.mutate({ id: filter.id })}
+                    className="rounded bg-red-600 px-3 py-1 hover:bg-red-700"
+                    disabled={deleteFilter.isPending}
+                  >
+                    Delete
+                  </button>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="text-gray-400">No filters yet. Create one to test!</p>
+          )}
+        </section>
+      )}
+
+      {/* Test Sort CRUD */}
+      {viewId && fields && fields.length > 0 && (
+        <section className="mb-8 rounded-lg bg-gray-800 p-6">
+          <h2 className="mb-4 text-2xl font-bold">Sorts for Selected View</h2>
+          <div className="mb-4 space-x-2">
+            <button
+              onClick={() => {
+                const firstField = fields[0];
+                if (firstField) {
+                  createSort.mutate({
+                    viewId,
+                    fieldId: firstField.id,
+                    direction: "ASC",
+                  });
+                }
+              }}
+              className="rounded bg-teal-600 px-4 py-2 hover:bg-teal-700"
+              disabled={createSort.isPending || !fields[0]}
+            >
+              {createSort.isPending ? "Creating..." : "Create Sort (ASC)"}
+            </button>
+            <button
+              onClick={() => {
+                const firstField = fields[0];
+                if (firstField) {
+                  createSort.mutate({
+                    viewId,
+                    fieldId: firstField.id,
+                    direction: "DESC",
+                  });
+                }
+              }}
+              className="rounded bg-teal-600 px-4 py-2 hover:bg-teal-700"
+              disabled={createSort.isPending || !fields[0]}
+            >
+              {createSort.isPending ? "Creating..." : "Create Sort (DESC)"}
+            </button>
+          </div>
+          {sorts && sorts.length > 0 ? (
+            <div className="space-y-2">
+              {sorts.map((sort) => (
+                <div
+                  key={sort.id}
+                  className="flex items-center justify-between rounded bg-gray-700 p-3 text-sm"
+                >
+                  <div>
+                    <span className="font-bold">{sort.field.name}</span>
+                    <span className="ml-2 text-gray-400">{sort.direction}</span>
+                  </div>
+                  <button
+                    onClick={() => deleteSort.mutate({ id: sort.id })}
+                    className="rounded bg-red-600 px-3 py-1 hover:bg-red-700"
+                    disabled={deleteSort.isPending}
+                  >
+                    Delete
+                  </button>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="text-gray-400">No sorts yet. Create one to test!</p>
+          )}
         </section>
       )}
     </div>
