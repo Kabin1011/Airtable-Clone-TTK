@@ -12,9 +12,11 @@ export const viewRouter = createTRPCRouter({
         include: {
           filters: {
             orderBy: { order: "asc" },
+            include: { field: true },
           },
           sorts: {
             orderBy: { order: "asc" },
+            include: { field: true },
           },
           hiddenFields: true,
         },

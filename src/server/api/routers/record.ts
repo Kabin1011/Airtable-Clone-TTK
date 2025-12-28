@@ -8,33 +8,146 @@ export const recordRouter = createTRPCRouter({
         tableId: z.string(),
         limit: z.number().min(1).max(100).default(50),
         cursor: z.string().optional(),
+        viewId: z.string().optional(), // Add viewId for filtering/sorting
     }),
     )
     .query(async ({ ctx, input }) => {
-    const { tableId, limit, cursor } = input;
+    const { tableId, limit, cursor, viewId } = input;
 
-    const items = await ctx.db.record.findMany({
-        take: limit + 1, 
+    // Fetch all records with cells first
+    const allRecords = await ctx.db.record.findMany({
         where: { tableId },
-        cursor: cursor ? { id: cursor } : undefined, 
-        orderBy: { order: "asc" },
         include: {
         cells: {
             include: {
-            field: true, // Include field info for each cell
+            field: true,
             },
         },
         },
     });
 
+    let filteredRecords = allRecords;
+
+    // Apply view filters and sorts if viewId is provided
+    if (viewId) {
+        const view = await ctx.db.view.findUnique({
+        where: { id: viewId },
+        include: {
+            filters: {
+            orderBy: { order: "asc" },
+            include: { field: true },
+            },
+            sorts: {
+            orderBy: { order: "asc" },
+            include: { field: true },
+            },
+        },
+        });
+
+        if (view) {
+        // Apply filters
+        if (view.filters.length > 0) {
+            filteredRecords = filteredRecords.filter((record) => {
+            // All filters must pass (AND logic)
+            return view.filters.every((filter) => {
+                const cell = record.cells.find((c) => c.fieldId === filter.fieldId);
+                const cellValue = cell?.value;
+                const filterValue = filter.value;
+
+                switch (filter.operator) {
+                case "EQUALS":
+                    return cellValue === filterValue;
+                case "NOT_EQUALS":
+                    return cellValue !== filterValue;
+                case "CONTAINS":
+                    return (
+                    typeof cellValue === "string" &&
+                    typeof filterValue === "string" &&
+                    cellValue.includes(filterValue)
+                    );
+                case "NOT_CONTAINS":
+                    return (
+                    typeof cellValue === "string" &&
+                    typeof filterValue === "string" &&
+                    !cellValue.includes(filterValue)
+                    );
+                case "GREATER_THAN":
+                    return (
+                    typeof cellValue === "number" &&
+                    typeof filterValue === "number" &&
+                    cellValue > filterValue
+                    );
+                case "LESS_THAN":
+                    return (
+                    typeof cellValue === "number" &&
+                    typeof filterValue === "number" &&
+                    cellValue < filterValue
+                    );
+                case "IS_EMPTY":
+                    return cellValue === null || cellValue === undefined || cellValue === "";
+                case "IS_NOT_EMPTY":
+                    return cellValue !== null && cellValue !== undefined && cellValue !== "";
+                default:
+                    return true;
+                }
+            });
+            });
+        }
+
+        // Apply sorts
+        if (view.sorts.length > 0) {
+            filteredRecords.sort((a, b) => {
+            for (const sort of view.sorts) {
+                const aCell = a.cells.find((c) => c.fieldId === sort.fieldId);
+                const bCell = b.cells.find((c) => c.fieldId === sort.fieldId);
+                const aValue = aCell?.value;
+                const bValue = bCell?.value;
+
+                // Handle null/undefined values
+                if (aValue === null || aValue === undefined) return 1;
+                if (bValue === null || bValue === undefined) return -1;
+
+                let comparison = 0;
+                if (typeof aValue === "string" && typeof bValue === "string") {
+                comparison = aValue.localeCompare(bValue);
+                } else if (typeof aValue === "number" && typeof bValue === "number") {
+                comparison = aValue - bValue;
+                }
+
+                if (comparison !== 0) {
+                return sort.direction === "ASC" ? comparison : -comparison;
+                }
+            }
+            return 0;
+            });
+        }
+        }
+    }
+
+    // Apply default order if no sorts applied
+    if (!viewId || !filteredRecords.length) {
+        filteredRecords.sort((a, b) => a.order - b.order);
+    }
+
+    // Apply cursor-based pagination
+    let startIndex = 0;
+    if (cursor) {
+        const cursorIndex = filteredRecords.findIndex((r) => r.id === cursor);
+        if (cursorIndex !== -1) {
+        startIndex = cursorIndex + 1;
+        }
+    }
+
+    const paginatedRecords = filteredRecords.slice(startIndex, startIndex + limit + 1);
+
     let nextCursor: string | undefined = undefined;
-    if (items.length > limit) {
-        const nextItem = items.pop(); // Remove extra item
-        nextCursor = nextItem!.id; // Use its ID as next cursor
+    if (paginatedRecords.length > limit) {
+        const nextItem = paginatedRecords.pop();
+        nextCursor = nextItem!.id;
     }
 
     return {
-        items,
+        items: paginatedRecords,
         nextCursor,
     };
     }),
