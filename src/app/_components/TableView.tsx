@@ -65,11 +65,14 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
     fetchNextPage,
     hasNextPage,
     isFetchingNextPage,
+    isLoading,
+    isFetching,
   } = api.record.getByTableId.useInfiniteQuery(
     { tableId, limit: 50, viewId: selectedViewId ?? undefined },
     {
       getNextPageParam: (lastPage) => lastPage.nextCursor,
       enabled: !!tableId,
+      placeholderData: (previousData) => previousData, // Keep previous data while loading new data
     }
   );
 
@@ -95,8 +98,83 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
   });
 
   const updateCell = api.cell.update.useMutation({
-    onSuccess: async () => {
-      await utils.record.getByTableId.invalidate({ tableId });
+    // Optimistic update - update UI immediately without waiting for server
+    onMutate: async (newData) => {
+      // Cancel any outgoing refetches
+      await utils.record.getByTableId.cancel({ tableId });
+
+      // Snapshot the previous value
+      const previousData = utils.record.getByTableId.getInfiniteData({
+        tableId,
+        limit: 50,
+        viewId: selectedViewId ?? undefined
+      });
+
+      // Optimistically update to the new value
+      utils.record.getByTableId.setInfiniteData(
+        { tableId, limit: 50, viewId: selectedViewId ?? undefined },
+        (old) => {
+          if (!old) return old;
+
+          return {
+            ...old,
+            pages: old.pages.map((page) => ({
+              ...page,
+              items: page.items.map((record) => {
+                if (record.id !== newData.recordId) return record;
+
+                // Find if cell exists
+                const existingCell = record.cells.find((c) => c.fieldId === newData.fieldId);
+                const field = fields?.find((f) => f.id === newData.fieldId);
+
+                if (existingCell) {
+                  // Update existing cell
+                  return {
+                    ...record,
+                    cells: record.cells.map((cell) => {
+                      if (cell.fieldId !== newData.fieldId) return cell;
+                      return { ...cell, value: newData.value };
+                    }),
+                  };
+                } else if (field) {
+                  // Create new cell optimistically (for empty cells)
+                  return {
+                    ...record,
+                    cells: [
+                      ...record.cells,
+                      {
+                        id: `temp-${newData.recordId}-${newData.fieldId}`,
+                        fieldId: newData.fieldId,
+                        recordId: newData.recordId,
+                        value: newData.value,
+                        field,
+                      },
+                    ],
+                  };
+                }
+
+                return record;
+              }),
+            })),
+          };
+        }
+      );
+
+      // Return context with previous data
+      return { previousData };
+    },
+    // If mutation fails, rollback to previous value
+    onError: (err, newData, context) => {
+      if (context?.previousData) {
+        utils.record.getByTableId.setInfiniteData(
+          { tableId, limit: 50, viewId: selectedViewId ?? undefined },
+          context.previousData
+        );
+      }
+    },
+    // Always refetch after error or success to ensure sync with server
+    onSettled: () => {
+      void utils.record.getByTableId.invalidate({ tableId });
     },
   });
 
@@ -120,9 +198,11 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
   // Filter mutations
   const createFilter = api.filter.create.useMutation({
     onSuccess: async () => {
-      if (selectedViewId) {
-        await utils.view.getByTableId.invalidate({ tableId });
-      }
+      // Invalidate both views and records to refresh filtered data
+      await Promise.all([
+        utils.view.getByTableId.invalidate({ tableId }),
+        utils.record.getByTableId.invalidate({ tableId })
+      ]);
       setNewFilterFieldId("");
       setNewFilterValue("");
       setIsFilterOpen(false);
@@ -131,18 +211,22 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
 
   const deleteFilter = api.filter.delete.useMutation({
     onSuccess: async () => {
-      if (selectedViewId) {
-        await utils.view.getByTableId.invalidate({ tableId });
-      }
+      // Invalidate both views and records to refresh filtered data
+      await Promise.all([
+        utils.view.getByTableId.invalidate({ tableId }),
+        utils.record.getByTableId.invalidate({ tableId })
+      ]);
     },
   });
 
   // Sort mutations
   const createSort = api.sort.create.useMutation({
     onSuccess: async () => {
-      if (selectedViewId) {
-        await utils.view.getByTableId.invalidate({ tableId });
-      }
+      // Invalidate both views and records to refresh sorted data
+      await Promise.all([
+        utils.view.getByTableId.invalidate({ tableId }),
+        utils.record.getByTableId.invalidate({ tableId })
+      ]);
       setNewSortFieldId("");
       setIsSortOpen(false);
     },
@@ -150,9 +234,11 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
 
   const deleteSort = api.sort.delete.useMutation({
     onSuccess: async () => {
-      if (selectedViewId) {
-        await utils.view.getByTableId.invalidate({ tableId });
-      }
+      // Invalidate both views and records to refresh sorted data
+      await Promise.all([
+        utils.view.getByTableId.invalidate({ tableId }),
+        utils.record.getByTableId.invalidate({ tableId })
+      ]);
     },
   });
 
@@ -396,8 +482,14 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
               </>
             )}
           </div>
-          <div className="text-sm text-gray-600">
-            Showing {records.length} rows
+          <div className="flex items-center gap-2 text-sm text-gray-600">
+            {isFetching && !isFetchingNextPage && (
+              <svg className="h-4 w-4 animate-spin text-blue-600" fill="none" viewBox="0 0 24 24">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+              </svg>
+            )}
+            <span>Showing {records.length} rows</span>
             {hasNextPage && <span className="ml-2 text-gray-400">(more available)</span>}
           </div>
         </div>

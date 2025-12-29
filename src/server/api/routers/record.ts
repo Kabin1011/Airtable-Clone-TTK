@@ -52,7 +52,17 @@ export const recordRouter = createTRPCRouter({
             return view.filters.every((filter) => {
                 const cell = record.cells.find((c) => c.fieldId === filter.fieldId);
                 const cellValue = cell?.value;
-                const filterValue = filter.value;
+                let filterValue = filter.value;
+                const fieldType = filter.field?.type;
+
+                // Convert filter value to match field type
+                if (filterValue !== null && filterValue !== undefined) {
+                  if (fieldType === "NUMBER" && typeof filterValue === "string") {
+                    filterValue = Number(filterValue);
+                  } else if (fieldType === "CHECKBOX" && typeof filterValue === "string") {
+                    filterValue = filterValue === "true" || filterValue === "1";
+                  }
+                }
 
                 switch (filter.operator) {
                 case "EQUALS":
@@ -63,13 +73,13 @@ export const recordRouter = createTRPCRouter({
                     return (
                     typeof cellValue === "string" &&
                     typeof filterValue === "string" &&
-                    cellValue.includes(filterValue)
+                    cellValue.toLowerCase().includes(filterValue.toLowerCase())
                     );
                 case "NOT_CONTAINS":
                     return (
                     typeof cellValue === "string" &&
                     typeof filterValue === "string" &&
-                    !cellValue.includes(filterValue)
+                    !cellValue.toLowerCase().includes(filterValue.toLowerCase())
                     );
                 case "GREATER_THAN":
                     return (

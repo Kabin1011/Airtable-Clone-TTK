@@ -4,6 +4,7 @@ import { useState, useEffect, useRef } from "react";
 import type { FieldType } from "../../../../generated/prisma";
 import { SELECT_COLORS } from "~/lib/fieldTypes";
 import { FileUpload } from "./FileUpload";
+import { useDebounce } from "~/hooks/useDebounce";
 
 interface CellEditorProps {
   value: any;
@@ -21,7 +22,23 @@ export function CellEditor({
   onCancel,
 }: CellEditorProps) {
   const [value, setValue] = useState(initialValue);
+  const debouncedValue = useDebounce(value, 500);
   const inputRef = useRef<HTMLInputElement | HTMLTextAreaElement>(null);
+  const isInitialMount = useRef(true);
+
+  // Auto-save debounced text changes (except on initial mount)
+  useEffect(() => {
+    if (isInitialMount.current) {
+      isInitialMount.current = false;
+      return;
+    }
+
+    // Only debounce text field types
+    const isTextType = ["TEXT", "LONG_TEXT", "URL", "EMAIL", "PHONE"].includes(fieldType);
+    if (isTextType && debouncedValue !== initialValue) {
+      onSave(debouncedValue);
+    }
+  }, [debouncedValue, fieldType, initialValue, onSave]);
 
   useEffect(() => {
     // Auto-focus on mount
@@ -55,7 +72,6 @@ export function CellEditor({
           value={value ?? ""}
           onChange={(e) => setValue(e.target.value)}
           onKeyDown={handleKeyDown}
-          onBlur={handleSave}
           className="w-full border border-blue-500 px-2 py-1 text-sm focus:outline-none"
           placeholder={`Enter ${fieldType.toLowerCase()}...`}
         />
@@ -68,7 +84,6 @@ export function CellEditor({
           value={value ?? ""}
           onChange={(e) => setValue(e.target.value)}
           onKeyDown={handleKeyDown}
-          onBlur={handleSave}
           className="w-full border border-blue-500 px-2 py-1 text-sm focus:outline-none"
           placeholder="Enter text..."
           rows={3}
