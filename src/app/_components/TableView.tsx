@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useMemo, useEffect } from "react";
+import { useState, useMemo } from "react";
 import { api } from "~/trpc/react";
 import Link from "next/link";
 import {
@@ -9,7 +9,10 @@ import {
   flexRender,
   type ColumnDef,
 } from "@tanstack/react-table";
-import type { Field, Record as PrismaRecord, Cell } from "../../../generated/prisma";
+import type { Field, Record as PrismaRecord, Cell, FieldType } from "../../../generated/prisma";
+import { CellDisplay } from "./cells/CellDisplay";
+import { CellEditor } from "./cells/CellEditor";
+import { FIELD_TYPE_CONFIGS } from "~/lib/fieldTypes";
 
 type RecordWithCells = PrismaRecord & {
   cells: (Cell & { field: Field })[];
@@ -18,7 +21,7 @@ type RecordWithCells = PrismaRecord & {
 export function TableView({ baseId, tableId }: { baseId: string; tableId: string }) {
   const [isCreatingField, setIsCreatingField] = useState(false);
   const [newFieldName, setNewFieldName] = useState("");
-  const [newFieldType, setNewFieldType] = useState<"TEXT" | "NUMBER">("TEXT");
+  const [newFieldType, setNewFieldType] = useState<FieldType>("TEXT");
 
   // View state
   const [selectedViewId, setSelectedViewId] = useState<string | null>(null);
@@ -155,10 +158,16 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
 
   const handleCreateField = () => {
     if (!newFieldName.trim()) return;
+
+    // Get default config for this field type
+    const fieldConfig = FIELD_TYPE_CONFIGS[newFieldType];
+    const config = fieldConfig?.defaultConfig ?? null;
+
     createField.mutate({
       tableId,
       name: newFieldName,
       type: newFieldType,
+      config,
     });
   };
 
@@ -228,8 +237,9 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
             <EditableCell
               recordId={record.id}
               fieldId={field.id}
-              value={value as string | number | null}
+              value={value}
               fieldType={field.type}
+              fieldConfig={field.config}
               onUpdate={(newValue) => {
                 updateCell.mutate({
                   recordId: record.id,
@@ -702,11 +712,20 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
               <label className="mb-2 block text-sm font-medium text-gray-700">Field Type</label>
               <select
                 value={newFieldType}
-                onChange={(e) => setNewFieldType(e.target.value as "TEXT" | "NUMBER")}
+                onChange={(e) => setNewFieldType(e.target.value as FieldType)}
                 className="w-full rounded-lg border border-gray-300 px-3 py-2 text-gray-900 focus:border-blue-500 focus:outline-none"
               >
-                <option value="TEXT">Text</option>
+                <option value="TEXT">Single line text</option>
+                <option value="LONG_TEXT">Long text</option>
                 <option value="NUMBER">Number</option>
+                <option value="DATE">Date</option>
+                <option value="CHECKBOX">Checkbox</option>
+                <option value="SELECT">Single select</option>
+                <option value="MULTI_SELECT">Multiple select</option>
+                <option value="URL">URL</option>
+                <option value="EMAIL">Email</option>
+                <option value="PHONE">Phone</option>
+                <option value="ATTACHMENT">Attachment (coming soon)</option>
               </select>
             </div>
 
@@ -743,49 +762,47 @@ function EditableCell({
   fieldId,
   value,
   fieldType,
+  fieldConfig,
   onUpdate,
 }: {
   recordId: string;
   fieldId: string;
-  value: string | number | null;
-  fieldType: string;
-  onUpdate: (value: string | number) => void;
+  value: any;
+  fieldType: FieldType;
+  fieldConfig?: any;
+  onUpdate: (value: any) => void;
 }) {
   const [isEditing, setIsEditing] = useState(false);
-  const [editValue, setEditValue] = useState(value?.toString() ?? "");
 
-  const handleSave = () => {
-    const finalValue = fieldType === "NUMBER" ? parseFloat(editValue) || 0 : editValue;
-    onUpdate(finalValue);
+  const handleSave = (newValue: any) => {
+    onUpdate(newValue);
+    setIsEditing(false);
+  };
+
+  const handleCancel = () => {
     setIsEditing(false);
   };
 
   if (isEditing) {
     return (
-      <input
-        type={fieldType === "NUMBER" ? "number" : "text"}
-        value={editValue}
-        onChange={(e) => setEditValue(e.target.value)}
-        onBlur={handleSave}
-        onKeyDown={(e) => {
-          if (e.key === "Enter") handleSave();
-          if (e.key === "Escape") setIsEditing(false);
-        }}
-        className="w-full border-0 px-4 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
-        autoFocus
-      />
+      <div className="min-h-[40px] px-4 py-2">
+        <CellEditor
+          value={value}
+          fieldType={fieldType}
+          fieldConfig={fieldConfig}
+          onSave={handleSave}
+          onCancel={handleCancel}
+        />
+      </div>
     );
   }
 
   return (
     <div
-      onClick={() => {
-        setEditValue(value?.toString() ?? "");
-        setIsEditing(true);
-      }}
-      className="min-h-[40px] cursor-text px-4 py-2 hover:bg-blue-50"
+      onClick={() => setIsEditing(true)}
+      className="min-h-[40px] cursor-pointer px-4 py-2 hover:bg-blue-50"
     >
-      {value?.toString() || ""}
+      <CellDisplay value={value} fieldType={fieldType} fieldConfig={fieldConfig} />
     </div>
   );
 }

@@ -103,15 +103,30 @@ export const recordRouter = createTRPCRouter({
                 const aValue = aCell?.value;
                 const bValue = bCell?.value;
 
-                // Handle null/undefined values
+                // Handle null/undefined values - always sort to bottom
                 if (aValue === null || aValue === undefined) return 1;
                 if (bValue === null || bValue === undefined) return -1;
 
                 let comparison = 0;
-                if (typeof aValue === "string" && typeof bValue === "string") {
-                comparison = aValue.localeCompare(bValue);
-                } else if (typeof aValue === "number" && typeof bValue === "number") {
-                comparison = aValue - bValue;
+                const fieldType = sort.field?.type;
+
+                // Sort based on field type
+                if (fieldType === "DATE") {
+                // Parse as dates
+                const aDate = new Date(aValue as string).getTime();
+                const bDate = new Date(bValue as string).getTime();
+                comparison = aDate - bDate;
+                } else if (fieldType === "NUMBER") {
+                // Numeric comparison
+                comparison = (aValue as number) - (bValue as number);
+                } else if (fieldType === "CHECKBOX") {
+                // Boolean comparison (true first when ascending)
+                comparison = (aValue ? 1 : 0) - (bValue ? 1 : 0);
+                } else {
+                // String comparison for TEXT, SELECT, etc.
+                const aStr = String(aValue);
+                const bStr = String(bValue);
+                comparison = aStr.localeCompare(bStr);
                 }
 
                 if (comparison !== 0) {
