@@ -96,4 +96,38 @@ export const viewRouter = createTRPCRouter({
         where: { id: input.id },
       });
     }),
+
+  // Hide a field in a view
+  hideField: publicProcedure
+    .input(
+      z.object({
+        viewId: z.string(),
+        fieldId: z.string(),
+      })
+    )
+    .mutation(async ({ ctx, input }) => {
+      return ctx.db.hiddenField.create({
+        data: {
+          viewId: input.viewId,
+          fieldId: input.fieldId,
+        },
+      });
+    }),
+
+  // Show a field in a view (unhide)
+  showField: publicProcedure
+    .input(
+      z.object({
+        viewId: z.string(),
+        fieldId: z.string(),
+      })
+    )
+    .mutation(async ({ ctx, input }) => {
+      return ctx.db.hiddenField.deleteMany({
+        where: {
+          viewId: input.viewId,
+          fieldId: input.fieldId,
+        },
+      });
+    }),
 });

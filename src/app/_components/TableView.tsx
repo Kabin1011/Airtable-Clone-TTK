@@ -39,6 +39,12 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
   const [newSortFieldId, setNewSortFieldId] = useState("");
   const [newSortDirection, setNewSortDirection] = useState<"ASC" | "DESC">("ASC");
 
+  // Field edit state
+  const [editingFieldId, setEditingFieldId] = useState<string | null>(null);
+  const [editFieldName, setEditFieldName] = useState("");
+  const [fieldMenuOpenId, setFieldMenuOpenId] = useState<string | null>(null);
+  const [isHiddenFieldsOpen, setIsHiddenFieldsOpen] = useState(false);
+
   const utils = api.useUtils();
 
   const { data: base } = api.base.getById.useQuery({ id: baseId }, { enabled: !!baseId });
@@ -91,9 +97,70 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
     },
   });
 
+  const updateField = api.field.update.useMutation({
+    onSuccess: async () => {
+      await Promise.all([
+        utils.field.getByTableId.invalidate({ tableId }),
+        utils.record.getByTableId.invalidate({ tableId }),
+      ]);
+    },
+  });
+
+  const deleteField = api.field.delete.useMutation({
+    onSuccess: async () => {
+      await Promise.all([
+        utils.field.getByTableId.invalidate({ tableId }),
+        utils.record.getByTableId.invalidate({ tableId }),
+      ]);
+    },
+  });
+
   const createRecord = api.record.create.useMutation({
     onSuccess: async () => {
       await utils.record.getByTableId.invalidate({ tableId });
+    },
+  });
+
+  const deleteRecord = api.record.delete.useMutation({
+    onMutate: async (variables) => {
+      // Cancel outgoing refetches
+      await utils.record.getByTableId.cancel({ tableId });
+
+      // Snapshot previous data
+      const previousData = utils.record.getByTableId.getInfiniteData({
+        tableId,
+        limit: 50,
+        viewId: selectedViewId ?? undefined
+      });
+
+      // Optimistically remove record from UI
+      utils.record.getByTableId.setInfiniteData(
+        { tableId, limit: 50, viewId: selectedViewId ?? undefined },
+        (old) => {
+          if (!old) return old;
+          return {
+            ...old,
+            pages: old.pages.map((page) => ({
+              ...page,
+              items: page.items.filter((record) => record.id !== variables.id),
+            })),
+          };
+        }
+      );
+
+      return { previousData };
+    },
+    onError: (err, variables, context) => {
+      // Rollback on error
+      if (context?.previousData) {
+        utils.record.getByTableId.setInfiniteData(
+          { tableId, limit: 50, viewId: selectedViewId ?? undefined },
+          context.previousData
+        );
+      }
+    },
+    onSettled: () => {
+      void utils.record.getByTableId.invalidate({ tableId });
     },
   });
 
@@ -242,6 +309,19 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
     },
   });
 
+  // Hidden field mutations
+  const hideField = api.view.hideField.useMutation({
+    onSuccess: async () => {
+      await utils.view.getByTableId.invalidate({ tableId });
+    },
+  });
+
+  const showField = api.view.showField.useMutation({
+    onSuccess: async () => {
+      await utils.view.getByTableId.invalidate({ tableId });
+    },
+  });
+
   const handleCreateField = () => {
     if (!newFieldName.trim()) return;
 
@@ -291,18 +371,41 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
   const columns = useMemo<ColumnDef<RecordWithCells>[]>(() => {
     if (!fields) return [];
 
+    // Get hidden field IDs for current view
+    const hiddenFieldIds = new Set(
+      currentView?.hiddenFields?.map((hf) => hf.fieldId) ?? []
+    );
+
+    // Filter out hidden fields
+    const visibleFields = fields.filter((field) => !hiddenFieldIds.has(field.id));
+
     const cols: ColumnDef<RecordWithCells>[] = [
       {
         id: "rowNumber",
         header: () => <div className="px-4 py-2 text-xs font-medium text-gray-500">#</div>,
         cell: ({ row }) => (
-          <div className="px-4 py-2 text-xs text-gray-500">{row.index + 1}</div>
+          <div className="group flex items-center justify-between px-4 py-2 text-xs text-gray-500">
+            <span>{row.index + 1}</span>
+            <button
+              onClick={() => {
+                if (confirm('Delete this record?')) {
+                  deleteRecord.mutate({ id: row.original.id });
+                }
+              }}
+              className="opacity-0 transition-opacity hover:text-red-600 group-hover:opacity-100"
+              title="Delete record"
+            >
+              <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+              </svg>
+            </button>
+          </div>
         ),
-        size: 50,
+        size: 60,
       },
     ];
 
-    fields.forEach((field) => {
+    visibleFields.forEach((field) => {
       cols.push({
         id: field.id,
         accessorFn: (record) => {
@@ -311,8 +414,93 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
         },
         header: () => (
           <div className="group relative flex items-center justify-between px-4 py-2">
-            <span className="font-medium text-gray-900">{field.name}</span>
-            <span className="ml-2 text-xs text-gray-400">{field.type}</span>
+            {editingFieldId === field.id ? (
+              <input
+                type="text"
+                value={editFieldName}
+                onChange={(e) => setEditFieldName(e.target.value)}
+                onBlur={() => {
+                  if (editFieldName.trim() && editFieldName !== field.name) {
+                    updateField.mutate({ id: field.id, name: editFieldName });
+                  }
+                  setEditingFieldId(null);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    if (editFieldName.trim() && editFieldName !== field.name) {
+                      updateField.mutate({ id: field.id, name: editFieldName });
+                    }
+                    setEditingFieldId(null);
+                  } else if (e.key === 'Escape') {
+                    setEditingFieldId(null);
+                  }
+                }}
+                autoFocus
+                className="w-full rounded border border-blue-500 px-2 py-1 text-sm font-medium focus:outline-none"
+              />
+            ) : (
+              <>
+                <div className="flex items-center gap-2">
+                  <span className="font-medium text-gray-900">{field.name}</span>
+                  <span className="text-xs text-gray-400">{field.type}</span>
+                </div>
+                <div className="relative">
+                  <button
+                    onClick={() => setFieldMenuOpenId(fieldMenuOpenId === field.id ? null : field.id)}
+                    className="opacity-0 transition-opacity hover:text-gray-900 group-hover:opacity-100"
+                  >
+                    <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 5v.01M12 12v.01M12 19v.01M12 6a1 1 0 110-2 1 1 0 010 2zm0 7a1 1 0 110-2 1 1 0 010 2zm0 7a1 1 0 110-2 1 1 0 010 2z" />
+                    </svg>
+                  </button>
+                  {fieldMenuOpenId === field.id && (
+                    <div className="absolute right-0 top-full z-20 mt-1 w-48 rounded-lg border border-gray-200 bg-white shadow-lg">
+                      <button
+                        onClick={() => {
+                          setEditFieldName(field.name);
+                          setEditingFieldId(field.id);
+                          setFieldMenuOpenId(null);
+                        }}
+                        className="flex w-full items-center gap-2 px-4 py-2 text-left text-sm hover:bg-gray-50"
+                      >
+                        <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
+                        </svg>
+                        Rename field
+                      </button>
+                      {selectedViewId && (
+                        <button
+                          onClick={() => {
+                            hideField.mutate({ viewId: selectedViewId, fieldId: field.id });
+                            setFieldMenuOpenId(null);
+                          }}
+                          className="flex w-full items-center gap-2 px-4 py-2 text-left text-sm hover:bg-gray-50"
+                        >
+                          <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21" />
+                          </svg>
+                          Hide field
+                        </button>
+                      )}
+                      <button
+                        onClick={() => {
+                          if (confirm(`Delete field "${field.name}"? All data in this field will be lost.`)) {
+                            deleteField.mutate({ id: field.id });
+                          }
+                          setFieldMenuOpenId(null);
+                        }}
+                        className="flex w-full items-center gap-2 px-4 py-2 text-left text-sm text-red-600 hover:bg-red-50"
+                      >
+                        <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                        </svg>
+                        Delete field
+                      </button>
+                    </div>
+                  )}
+                </div>
+              </>
+            )}
           </div>
         ),
         cell: ({ row, getValue }) => {
@@ -476,6 +664,25 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
                   {currentView?.sorts && currentView.sorts.length > 0 && (
                     <span className="rounded-full bg-purple-600 px-1.5 py-0.5 text-xs text-white">
                       {currentView.sorts.length}
+                    </span>
+                  )}
+                </button>
+                <button
+                  onClick={() => setIsHiddenFieldsOpen(!isHiddenFieldsOpen)}
+                  className={`flex items-center gap-1 rounded px-3 py-1.5 text-sm font-medium ${
+                    isHiddenFieldsOpen || (currentView?.hiddenFields && currentView.hiddenFields.length > 0)
+                      ? "bg-gray-50 text-gray-700"
+                      : "text-gray-700 hover:bg-gray-100"
+                  }`}
+                >
+                  <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
+                  </svg>
+                  Hide fields
+                  {currentView?.hiddenFields && currentView.hiddenFields.length > 0 && (
+                    <span className="rounded-full bg-gray-600 px-1.5 py-0.5 text-xs text-white">
+                      {currentView.hiddenFields.length}
                     </span>
                   )}
                 </button>
@@ -675,6 +882,53 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
               {createSort.isPending ? "Adding..." : "Add"}
             </button>
           </div>
+        </div>
+      )}
+
+      {/* Hidden Fields Panel */}
+      {isHiddenFieldsOpen && selectedViewId && (
+        <div className="border-b border-gray-200 bg-gray-50 px-6 py-3">
+          <div className="mb-3 flex items-center justify-between">
+            <h3 className="text-sm font-semibold text-gray-900">Hidden Fields</h3>
+            {currentView?.hiddenFields && currentView.hiddenFields.length > 0 && (
+              <span className="text-xs text-gray-500">
+                {currentView.hiddenFields.length} hidden
+              </span>
+            )}
+          </div>
+
+          {currentView?.hiddenFields && currentView.hiddenFields.length > 0 ? (
+            <div className="space-y-2">
+              {currentView.hiddenFields.map((hiddenField) => {
+                const field = fields?.find((f) => f.id === hiddenField.fieldId);
+                if (!field) return null;
+                return (
+                  <div
+                    key={hiddenField.id}
+                    className="flex items-center justify-between rounded-lg border border-gray-200 bg-white p-3 text-sm shadow-sm"
+                  >
+                    <div className="flex items-center gap-2">
+                      <span className="font-medium text-gray-900">{field.name}</span>
+                      <span className="text-xs text-gray-400">{field.type}</span>
+                    </div>
+                    <button
+                      onClick={() => showField.mutate({ viewId: selectedViewId, fieldId: field.id })}
+                      className="flex items-center gap-1 rounded bg-blue-600 px-2 py-1 text-xs text-white hover:bg-blue-700"
+                      disabled={showField.isPending}
+                    >
+                      <svg className="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
+                      </svg>
+                      Show
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
+            <p className="text-sm text-gray-500">No hidden fields. Click the menu on any field header to hide it.</p>
+          )}
         </div>
       )}
 
