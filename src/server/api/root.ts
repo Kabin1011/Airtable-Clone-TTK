@@ -6,6 +6,7 @@ import { cellRouter } from "~/server/api/routers/cell";
 import { viewRouter } from "~/server/api/routers/view";
 import { filterRouter } from "~/server/api/routers/filter";
 import { sortRouter } from "~/server/api/routers/sort";
+import { importRouter } from "~/server/api/routers/import";
 import { createCallerFactory, createTRPCRouter } from "~/server/api/trpc";
 
 /**
@@ -22,6 +23,7 @@ export const appRouter = createTRPCRouter({
   view: viewRouter,
   filter: filterRouter,
   sort: sortRouter,
+  import: importRouter,
 });
 
 // export type definition of API

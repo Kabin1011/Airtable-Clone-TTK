@@ -1,14 +1,16 @@
 import { HydrateClient } from "~/trpc/server";
 import { TableView } from "~/app/_components/TableView";
 
-export default function TablePage({
+export default async function TablePage({
   params,
 }: {
-  params: { baseId: string; tableId: string };
+  params: Promise<{ baseId: string; tableId: string }>;
 }) {
+  const { baseId, tableId } = await params;
+
   return (
     <HydrateClient>
-      <TableView baseId={params.baseId} tableId={params.tableId} />
+      <TableView baseId={baseId} tableId={tableId} />
     </HydrateClient>
   );
 }

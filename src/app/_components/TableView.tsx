@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useMemo } from "react";
+import { useState, useMemo, useRef, useEffect, useCallback, memo } from "react";
 import { api } from "~/trpc/react";
 import Link from "next/link";
 import {
@@ -9,10 +9,14 @@ import {
   flexRender,
   type ColumnDef,
 } from "@tanstack/react-table";
+import { useVirtualizer } from "@tanstack/react-virtual";
 import type { Field, Record as PrismaRecord, Cell, FieldType } from "../../../generated/prisma";
 import { CellDisplay } from "./cells/CellDisplay";
 import { CellEditor } from "./cells/CellEditor";
 import { FIELD_TYPE_CONFIGS } from "~/lib/fieldTypes";
+import { useKeyboardShortcuts, type KeyboardShortcut } from "~/hooks/useKeyboardShortcuts";
+import { useExcelImport } from "~/hooks/useExcelImport";
+import { exportToExcel } from "~/lib/excelUtils";
 
 type RecordWithCells = PrismaRecord & {
   cells: (Cell & { field: Field })[];
@@ -44,6 +48,16 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
   const [editFieldName, setEditFieldName] = useState("");
   const [fieldMenuOpenId, setFieldMenuOpenId] = useState<string | null>(null);
   const [isHiddenFieldsOpen, setIsHiddenFieldsOpen] = useState(false);
+
+  // Keyboard shortcuts help modal
+  const [showShortcutsHelp, setShowShortcutsHelp] = useState(false);
+
+  // Cell navigation state
+  const [focusedCell, setFocusedCell] = useState<{ rowIndex: number; columnIndex: number } | null>(null);
+
+  // Excel import/export using dedicated hook
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const { handleImport: importExcel, isImporting, importError, importProgress, clearError } = useExcelImport(tableId);
 
   const utils = api.useUtils();
 
@@ -367,6 +381,162 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
     });
   };
 
+  // Keyboard shortcuts
+  const shortcuts: KeyboardShortcut[] = [
+    {
+      key: 'Escape',
+      description: 'Close modals and panels',
+      action: () => {
+        setIsCreatingField(false);
+        setIsCreatingView(false);
+        setIsFilterOpen(false);
+        setIsSortOpen(false);
+        setIsHiddenFieldsOpen(false);
+        setFieldMenuOpenId(null);
+        setShowShortcutsHelp(false);
+      },
+    },
+    {
+      key: 'n',
+      meta: true,
+      description: 'Add new record',
+      action: () => {
+        if (!tableId) return;
+        createRecord.mutate({ tableId });
+      },
+    },
+    {
+      key: 'f',
+      meta: true,
+      description: 'Toggle filters',
+      action: () => {
+        if (!selectedViewId) return;
+        setIsFilterOpen(!isFilterOpen);
+      },
+    },
+    {
+      key: 's',
+      meta: true,
+      shift: true,
+      description: 'Toggle sorts',
+      action: () => {
+        if (!selectedViewId) return;
+        setIsSortOpen(!isSortOpen);
+      },
+    },
+    {
+      key: 'h',
+      meta: true,
+      description: 'Toggle hidden fields',
+      action: () => {
+        if (!selectedViewId) return;
+        setIsHiddenFieldsOpen(!isHiddenFieldsOpen);
+      },
+    },
+    {
+      key: '/',
+      meta: true,
+      description: 'Show keyboard shortcuts',
+      action: () => {
+        setShowShortcutsHelp(true);
+      },
+    },
+    {
+      key: '?',
+      shift: true,
+      description: 'Show keyboard shortcuts',
+      action: () => {
+        setShowShortcutsHelp(true);
+      },
+    },
+  ];
+
+  useKeyboardShortcuts(shortcuts);
+
+  // Navigation handler - memoized to prevent recreating on every render
+  const handleCellNavigate = useCallback((rowIndex: number, columnIndex: number, direction: 'up' | 'down' | 'left' | 'right' | 'tab' | 'shift-tab', totalRows: number, totalCols: number) => {
+    let newRow = rowIndex;
+    let newCol = columnIndex;
+
+    switch (direction) {
+      case 'up':
+        newRow = Math.max(0, rowIndex - 1);
+        break;
+      case 'down':
+        newRow = Math.min(totalRows - 1, rowIndex + 1);
+        break;
+      case 'left':
+        newCol = Math.max(1, columnIndex - 1); // Skip row number column (index 0)
+        break;
+      case 'right':
+      case 'tab':
+        newCol = columnIndex + 1;
+        if (newCol >= totalCols) {
+          // Move to first cell of next row
+          newCol = 1;
+          newRow = Math.min(totalRows - 1, rowIndex + 1);
+        }
+        break;
+      case 'shift-tab':
+        newCol = columnIndex - 1;
+        if (newCol < 1) {
+          // Move to last cell of previous row
+          newCol = totalCols - 1;
+          newRow = Math.max(0, rowIndex - 1);
+        }
+        break;
+    }
+
+    setFocusedCell({ rowIndex: newRow, columnIndex: newCol });
+  }, []);
+
+  // Handle Excel import
+  const handleImport = useCallback(async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    try {
+      await importExcel(file);
+
+      // Reset file input on success
+      if (fileInputRef.current) {
+        fileInputRef.current.value = '';
+      }
+    } catch (error) {
+      // Error is already handled by the hook
+      console.error('Import failed:', error);
+    }
+  }, [importExcel]);
+
+  // Handle Excel export
+  const handleExport = useCallback(() => {
+    if (!fields || !records) return;
+
+    // Get visible fields
+    const hiddenFieldIds = new Set(
+      currentView?.hiddenFields?.map((hf) => hf.fieldId) ?? []
+    );
+    const visibleFields = fields.filter((f) => !hiddenFieldIds.has(f.id));
+
+    // Convert records to export format
+    const exportData = records.map((record) => {
+      const rowData: Record<string, any> = {};
+
+      for (const field of visibleFields) {
+        const cell = record.cells.find((c) => c.fieldId === field.id);
+        rowData[field.name] = cell?.value ?? null;
+      }
+
+      return rowData;
+    });
+
+    // Generate filename with table name and timestamp
+    const timestamp = new Date().toISOString().split('T')[0];
+    const filename = `${table?.name || 'table'}_${timestamp}.xlsx`;
+
+    exportToExcel(exportData, visibleFields, filename);
+  }, [fields, records, currentView, table]);
+
   // Build columns for TanStack Table
   const columns = useMemo<ColumnDef<RecordWithCells>[]>(() => {
     if (!fields) return [];
@@ -503,9 +673,11 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
             )}
           </div>
         ),
-        cell: ({ row, getValue }) => {
+        cell: ({ row, getValue, column }) => {
           const value = getValue();
           const record = row.original;
+          const rowIndex = row.index;
+          const columnIndex = column.getIndex();
 
           return (
             <EditableCell
@@ -514,6 +686,12 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
               value={value}
               fieldType={field.type}
               fieldConfig={field.config}
+              rowIndex={rowIndex}
+              columnIndex={columnIndex}
+              isFocused={focusedCell?.rowIndex === rowIndex && focusedCell?.columnIndex === columnIndex}
+              totalRows={records.length}
+              totalCols={visibleFields.length + 1}
+              onNavigate={handleCellNavigate}
               onUpdate={(newValue) => {
                 updateCell.mutate({
                   recordId: record.id,
@@ -529,12 +707,37 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
     });
 
     return cols;
-  }, [fields, updateCell]);
+  }, [
+    fields,
+    currentView,
+    focusedCell,
+    editingFieldId,
+    editFieldName,
+    fieldMenuOpenId,
+    selectedViewId,
+    records.length,
+    updateCell,
+    deleteRecord,
+    deleteField,
+    updateField,
+    hideField,
+    handleCellNavigate
+  ]);
 
   const reactTable = useReactTable({
     data: records,
     columns,
     getCoreRowModel: getCoreRowModel(),
+  });
+
+  // Virtual scrolling setup
+  const tableContainerRef = useRef<HTMLDivElement>(null);
+
+  const rowVirtualizer = useVirtualizer({
+    count: reactTable.getRowModel().rows.length,
+    getScrollElement: () => tableContainerRef.current,
+    estimateSize: () => 40, // Estimated row height in pixels
+    overscan: 10, // Render 10 extra rows above and below viewport for smooth scrolling
   });
 
   if (!base || !table) {
@@ -564,6 +767,16 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
               <span className="font-semibold text-gray-900">{table.name}</span>
             </div>
           </div>
+          <button
+            onClick={() => setShowShortcutsHelp(true)}
+            className="flex items-center gap-1 rounded px-2 py-1 text-sm text-gray-600 hover:bg-gray-100"
+            title="Keyboard shortcuts"
+          >
+            <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8.228 9c.549-1.165 2.03-2 3.772-2 2.21 0 4 1.343 4 3 0 1.4-1.278 2.575-3.006 2.907-.542.104-.994.54-.994 1.093m0 3h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+            </svg>
+            <span className="hidden sm:inline">?</span>
+          </button>
         </div>
       </div>
 
@@ -629,6 +842,40 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
             >
               + Add field
             </button>
+
+            {/* Excel Import/Export */}
+            <div className="ml-2 flex items-center gap-2 border-l border-gray-200 pl-2">
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept=".xlsx,.xls"
+                onChange={handleImport}
+                className="hidden"
+              />
+              <button
+                onClick={() => fileInputRef.current?.click()}
+                disabled={isImporting}
+                className="flex items-center gap-1.5 rounded px-3 py-1.5 text-sm font-medium text-gray-700 hover:bg-gray-100 disabled:opacity-50"
+                title="Import from Excel"
+              >
+                <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
+                </svg>
+                {isImporting ? 'Importing...' : 'Import'}
+              </button>
+              <button
+                onClick={handleExport}
+                disabled={!records || records.length === 0}
+                className="flex items-center gap-1.5 rounded px-3 py-1.5 text-sm font-medium text-gray-700 hover:bg-gray-100 disabled:opacity-50"
+                title="Export to Excel"
+              >
+                <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M9 19l3 3m0 0l3-3m-3 3V10" />
+                </svg>
+                Export
+              </button>
+            </div>
+
             {selectedViewId && (
               <>
                 <button
@@ -701,6 +948,52 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
           </div>
         </div>
       </div>
+
+      {/* Import Progress Display */}
+      {importProgress && (
+        <div className="border-b border-blue-200 bg-blue-50 px-6 py-3">
+          <div className="space-y-2">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <svg className="h-5 w-5 animate-spin text-blue-600" fill="none" viewBox="0 0 24 24">
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                </svg>
+                <p className="text-sm font-medium text-blue-900">{importProgress.status}</p>
+              </div>
+              <span className="text-sm text-blue-700">{importProgress.current}%</span>
+            </div>
+            <div className="h-2 w-full overflow-hidden rounded-full bg-blue-200">
+              <div
+                className="h-full bg-blue-600 transition-all duration-300"
+                style={{ width: `${importProgress.current}%` }}
+              />
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Import Error Display */}
+      {importError && (
+        <div className="border-b border-red-200 bg-red-50 px-6 py-3">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <svg className="h-5 w-5 text-red-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+              </svg>
+              <p className="text-sm font-medium text-red-900">Import Error: {importError}</p>
+            </div>
+            <button
+              onClick={clearError}
+              className="rounded p-1 text-red-600 hover:bg-red-100"
+            >
+              <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+              </svg>
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Filter Panel */}
       {isFilterOpen && selectedViewId && (
@@ -932,8 +1225,8 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
         </div>
       )}
 
-      {/* Table Grid */}
-      <div className="flex-1 overflow-auto bg-white">
+      {/* Table Grid with Virtual Scrolling */}
+      <div ref={tableContainerRef} className="flex-1 overflow-auto bg-white">
         <div className="inline-block min-w-full">
           <table className="min-w-full border-collapse">
             <thead className="sticky top-0 z-10 bg-gray-50">
@@ -959,34 +1252,86 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
                   </td>
                 </tr>
               ) : (
-                reactTable.getRowModel().rows.map((row) => (
-                  <tr key={row.id} className="hover:bg-gray-50">
-                    {row.getVisibleCells().map((cell) => (
+                <>
+                  {/* Spacer for rows above viewport */}
+                  {rowVirtualizer.getVirtualItems()[0] && rowVirtualizer.getVirtualItems()[0].start > 0 && (
+                    <tr>
+                      <td colSpan={columns.length} style={{ height: `${rowVirtualizer.getVirtualItems()[0].start}px` }} />
+                    </tr>
+                  )}
+
+                  {/* Only render visible rows */}
+                  {rowVirtualizer.getVirtualItems().map((virtualRow) => {
+                    const row = reactTable.getRowModel().rows[virtualRow.index];
+                    if (!row) return null;
+
+                    return (
+                      <tr key={row.id} className="hover:bg-gray-50">
+                        {row.getVisibleCells().map((cell) => (
+                          <td
+                            key={cell.id}
+                            className="border border-gray-200"
+                            style={{ width: cell.column.getSize() }}
+                          >
+                            {flexRender(cell.column.columnDef.cell, cell.getContext())}
+                          </td>
+                        ))}
+                      </tr>
+                    );
+                  })}
+
+                  {/* Spacer for rows below viewport */}
+                  {rowVirtualizer.getVirtualItems().length > 0 && (
+                    <tr>
                       <td
-                        key={cell.id}
-                        className="border border-gray-200"
-                        style={{ width: cell.column.getSize() }}
-                      >
-                        {flexRender(cell.column.columnDef.cell, cell.getContext())}
-                      </td>
-                    ))}
-                  </tr>
-                ))
+                        colSpan={columns.length}
+                        style={{
+                          height: `${
+                            rowVirtualizer.getTotalSize() -
+                            (rowVirtualizer.getVirtualItems()[rowVirtualizer.getVirtualItems().length - 1]?.end ?? 0)
+                          }px`
+                        }}
+                      />
+                    </tr>
+                  )}
+                </>
               )}
             </tbody>
           </table>
         </div>
 
-        {/* Load More Button */}
-        {hasNextPage && (
+        {/* Auto-load more when scrolling near bottom */}
+        {hasNextPage && !isFetchingNextPage && (
+          <div
+            ref={(node) => {
+              if (node) {
+                const observer = new IntersectionObserver(
+                  (entries) => {
+                    if (entries[0]?.isIntersecting) {
+                      void fetchNextPage();
+                    }
+                  },
+                  { threshold: 0.1 }
+                );
+                observer.observe(node);
+                return () => observer.disconnect();
+              }
+            }}
+            className="border-t border-gray-200 bg-gray-50 p-4 text-center"
+          >
+            <span className="text-sm text-gray-500">Scroll down to load more...</span>
+          </div>
+        )}
+
+        {isFetchingNextPage && (
           <div className="border-t border-gray-200 bg-gray-50 p-4 text-center">
-            <button
-              onClick={() => fetchNextPage()}
-              disabled={isFetchingNextPage}
-              className="rounded-lg bg-blue-600 px-6 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50"
-            >
-              {isFetchingNextPage ? "Loading..." : "Load More Rows"}
-            </button>
+            <div className="flex items-center justify-center gap-2">
+              <svg className="h-4 w-4 animate-spin text-blue-600" fill="none" viewBox="0 0 24 24">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+              </svg>
+              <span className="text-sm text-gray-600">Loading more rows...</span>
+            </div>
           </div>
         )}
       </div>
@@ -1098,17 +1443,128 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
           </div>
         </div>
       )}
+
+      {/* Keyboard Shortcuts Help Modal */}
+      {showShortcutsHelp && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onClick={() => setShowShortcutsHelp(false)}>
+          <div className="w-full max-w-2xl rounded-lg bg-white p-6 shadow-xl" onClick={(e) => e.stopPropagation()}>
+            <div className="mb-4 flex items-center justify-between">
+              <h3 className="text-xl font-semibold text-gray-900">Keyboard Shortcuts</h3>
+              <button
+                onClick={() => setShowShortcutsHelp(false)}
+                className="text-gray-400 hover:text-gray-600"
+              >
+                <svg className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+
+            <div className="space-y-6">
+              <div>
+                <h4 className="mb-2 text-sm font-semibold text-gray-700">General</h4>
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm text-gray-600">Show keyboard shortcuts</span>
+                    <kbd className="rounded bg-gray-100 px-2 py-1 text-xs font-medium text-gray-700">?</kbd>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm text-gray-600">Close modals and panels</span>
+                    <kbd className="rounded bg-gray-100 px-2 py-1 text-xs font-medium text-gray-700">Esc</kbd>
+                  </div>
+                </div>
+              </div>
+
+              <div>
+                <h4 className="mb-2 text-sm font-semibold text-gray-700">Records</h4>
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm text-gray-600">Add new record</span>
+                    <kbd className="rounded bg-gray-100 px-2 py-1 text-xs font-medium text-gray-700">Cmd+N / Ctrl+N</kbd>
+                  </div>
+                </div>
+              </div>
+
+              <div>
+                <h4 className="mb-2 text-sm font-semibold text-gray-700">Views</h4>
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm text-gray-600">Toggle filters</span>
+                    <kbd className="rounded bg-gray-100 px-2 py-1 text-xs font-medium text-gray-700">Cmd+F / Ctrl+F</kbd>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm text-gray-600">Toggle sorts</span>
+                    <kbd className="rounded bg-gray-100 px-2 py-1 text-xs font-medium text-gray-700">Cmd+Shift+S / Ctrl+Shift+S</kbd>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm text-gray-600">Toggle hidden fields</span>
+                    <kbd className="rounded bg-gray-100 px-2 py-1 text-xs font-medium text-gray-700">Cmd+H / Ctrl+H</kbd>
+                  </div>
+                </div>
+              </div>
+
+              <div>
+                <h4 className="mb-2 text-sm font-semibold text-gray-700">Cell Navigation</h4>
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm text-gray-600">Navigate between cells</span>
+                    <kbd className="rounded bg-gray-100 px-2 py-1 text-xs font-medium text-gray-700">Arrow Keys</kbd>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm text-gray-600">Move to next cell</span>
+                    <kbd className="rounded bg-gray-100 px-2 py-1 text-xs font-medium text-gray-700">Tab</kbd>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm text-gray-600">Move to previous cell</span>
+                    <kbd className="rounded bg-gray-100 px-2 py-1 text-xs font-medium text-gray-700">Shift+Tab</kbd>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm text-gray-600">Edit selected cell</span>
+                    <kbd className="rounded bg-gray-100 px-2 py-1 text-xs font-medium text-gray-700">Enter</kbd>
+                  </div>
+                </div>
+              </div>
+
+              <div>
+                <h4 className="mb-2 text-sm font-semibold text-gray-700">Cell Editing</h4>
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm text-gray-600">Save and close cell</span>
+                    <kbd className="rounded bg-gray-100 px-2 py-1 text-xs font-medium text-gray-700">Enter</kbd>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm text-gray-600">Cancel cell editing</span>
+                    <kbd className="rounded bg-gray-100 px-2 py-1 text-xs font-medium text-gray-700">Esc</kbd>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div className="mt-6 border-t border-gray-200 pt-4">
+              <p className="text-xs text-gray-500">
+                Tip: Click anywhere outside this modal or press <kbd className="rounded bg-gray-100 px-1 py-0.5">Esc</kbd> to close
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
 
-// Editable Cell Component
-function EditableCell({
+// Editable Cell Component - Memoized to prevent unnecessary re-renders
+const EditableCell = memo(function EditableCell({
   recordId,
   fieldId,
   value,
   fieldType,
   fieldConfig,
+  rowIndex,
+  columnIndex,
+  isFocused,
+  totalRows,
+  totalCols,
+  onNavigate,
   onUpdate,
 }: {
   recordId: string;
@@ -1116,18 +1572,68 @@ function EditableCell({
   value: any;
   fieldType: FieldType;
   fieldConfig?: any;
+  rowIndex: number;
+  columnIndex: number;
+  isFocused: boolean;
+  totalRows: number;
+  totalCols: number;
+  onNavigate: (rowIndex: number, columnIndex: number, direction: 'up' | 'down' | 'left' | 'right' | 'tab' | 'shift-tab', totalRows: number, totalCols: number) => void;
   onUpdate: (value: any) => void;
 }) {
   const [isEditing, setIsEditing] = useState(false);
+  const cellRef = useRef<HTMLDivElement>(null);
 
-  const handleSave = (newValue: any) => {
+  // Auto-focus cell when it becomes focused programmatically (not on first render)
+  useEffect(() => {
+    if (isFocused && !isEditing && cellRef.current && document.activeElement !== cellRef.current) {
+      cellRef.current.focus();
+    }
+  }, [isFocused, isEditing]);
+
+  const handleSave = useCallback((newValue: any) => {
     onUpdate(newValue);
     setIsEditing(false);
-  };
+  }, [onUpdate]);
 
-  const handleCancel = () => {
+  const handleCancel = useCallback(() => {
     setIsEditing(false);
-  };
+  }, []);
+
+  const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
+    // Only handle navigation when not editing
+    if (isEditing) return;
+
+    switch (e.key) {
+      case 'ArrowUp':
+        e.preventDefault();
+        onNavigate(rowIndex, columnIndex, 'up', totalRows, totalCols);
+        break;
+      case 'ArrowDown':
+        e.preventDefault();
+        onNavigate(rowIndex, columnIndex, 'down', totalRows, totalCols);
+        break;
+      case 'ArrowLeft':
+        e.preventDefault();
+        onNavigate(rowIndex, columnIndex, 'left', totalRows, totalCols);
+        break;
+      case 'ArrowRight':
+        e.preventDefault();
+        onNavigate(rowIndex, columnIndex, 'right', totalRows, totalCols);
+        break;
+      case 'Tab':
+        e.preventDefault();
+        onNavigate(rowIndex, columnIndex, e.shiftKey ? 'shift-tab' : 'tab', totalRows, totalCols);
+        break;
+      case 'Enter':
+        e.preventDefault();
+        setIsEditing(true);
+        break;
+    }
+  }, [isEditing, onNavigate, rowIndex, columnIndex, totalRows, totalCols]);
+
+  const handleClick = useCallback(() => {
+    setIsEditing(true);
+  }, []);
 
   if (isEditing) {
     return (
@@ -1145,10 +1651,15 @@ function EditableCell({
 
   return (
     <div
-      onClick={() => setIsEditing(true)}
-      className="min-h-[40px] cursor-pointer px-4 py-2 hover:bg-blue-50"
+      ref={cellRef}
+      tabIndex={0}
+      onClick={handleClick}
+      onKeyDown={handleKeyDown}
+      className={`min-h-[40px] cursor-pointer px-4 py-2 hover:bg-blue-50 focus:outline-none ${
+        isFocused ? 'ring-2 ring-blue-500 ring-inset' : ''
+      }`}
     >
       <CellDisplay value={value} fieldType={fieldType} fieldConfig={fieldConfig} />
     </div>
   );
-}
+});
