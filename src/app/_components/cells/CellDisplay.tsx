@@ -79,6 +79,10 @@ export function CellDisplay({ value, fieldType, fieldConfig }: CellDisplayProps)
           rel="noopener noreferrer"
           className="text-blue-600 hover:underline"
           onClick={(e) => e.stopPropagation()}
+          onDoubleClick={(e) => {
+            e.preventDefault();
+            // Allow event to bubble to parent cell for edit mode
+          }}
         >
           {value}
         </a>
@@ -90,6 +94,10 @@ export function CellDisplay({ value, fieldType, fieldConfig }: CellDisplayProps)
           href={`mailto:${value}`}
           className="text-blue-600 hover:underline"
           onClick={(e) => e.stopPropagation()}
+          onDoubleClick={(e) => {
+            e.preventDefault();
+            // Allow event to bubble to parent cell for edit mode
+          }}
         >
           {value}
         </a>
@@ -101,6 +109,10 @@ export function CellDisplay({ value, fieldType, fieldConfig }: CellDisplayProps)
           href={`tel:${value}`}
           className="text-blue-600 hover:underline"
           onClick={(e) => e.stopPropagation()}
+          onDoubleClick={(e) => {
+            e.preventDefault();
+            // Allow event to bubble to parent cell for edit mode
+          }}
         >
           {value}
         </a>
@@ -166,6 +178,10 @@ export function CellDisplay({ value, fieldType, fieldConfig }: CellDisplayProps)
               rel="noopener noreferrer"
               className="flex items-center gap-1 rounded bg-blue-50 px-2 py-1 text-xs text-blue-700 hover:bg-blue-100"
               onClick={(e) => e.stopPropagation()}
+              onDoubleClick={(e) => {
+                e.preventDefault();
+                // Allow event to bubble to parent cell for edit mode
+              }}
               title={file.name}
             >
               <span>📎</span>

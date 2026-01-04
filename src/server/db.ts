@@ -10,6 +10,9 @@ const createPrismaClient = () =>
         url: env.DATABASE_URL,
       },
     },
+    // Performance optimizations
+    // Connection pool configuration is handled via DATABASE_URL connection string parameters
+    // Example: postgresql://user:password@host:port/database?connection_limit=10&pool_timeout=20
   });
 
 const globalForPrisma = globalThis as unknown as {

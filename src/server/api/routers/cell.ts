@@ -12,6 +12,7 @@ export const cellRouter = createTRPCRouter({
       }),
     )
     .mutation(async ({ ctx, input }) => {
+      // Optimized: Only select id to reduce data transfer
       return ctx.db.cell.upsert({
         where: {
           fieldId_recordId: {
@@ -27,10 +28,16 @@ export const cellRouter = createTRPCRouter({
           recordId: input.recordId,
           value: input.value,
         },
+        select: {
+          id: true,
+          fieldId: true,
+          recordId: true,
+          value: true,
+        },
       });
     }),
 
-  // Bulk update multiple cells
+  // Bulk update multiple cells - optimized with transactions
   bulkUpdate: publicProcedure
     .input(
       z.object({
@@ -44,13 +51,16 @@ export const cellRouter = createTRPCRouter({
       }),
     )
     .mutation(async ({ ctx, input }) => {
-      // Process in batches to avoid overwhelming the connection pool
-      const BATCH_SIZE = 10;
+      // Use a transaction for better performance and atomicity
+      // Process in larger batches for better throughput
+      const BATCH_SIZE = 50; // Increased from 10 for better performance
       const results = [];
 
       for (let i = 0; i < input.updates.length; i += BATCH_SIZE) {
         const batch = input.updates.slice(i, i + BATCH_SIZE);
-        const batchResults = await Promise.all(
+        
+        // Use transaction for batch operations
+        const batchResults = await ctx.db.$transaction(
           batch.map((update) =>
             ctx.db.cell.upsert({
               where: {
@@ -65,8 +75,17 @@ export const cellRouter = createTRPCRouter({
                 recordId: update.recordId,
                 value: update.value,
               },
+              select: {
+                id: true,
+                fieldId: true,
+                recordId: true,
+                value: true,
+              },
             }),
           ),
+          {
+            timeout: 10000, // 10 second timeout for large batches
+          }
         );
         results.push(...batchResults);
       }

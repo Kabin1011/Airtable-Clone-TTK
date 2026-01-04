@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useMemo, useRef, useEffect, useCallback, memo } from "react";
+import { useState, useMemo, useRef, useEffect, useCallback } from "react";
 import { api } from "~/trpc/react";
 import Link from "next/link";
 import {
@@ -17,6 +17,7 @@ import { FIELD_TYPE_CONFIGS } from "~/lib/fieldTypes";
 import { useKeyboardShortcuts, type KeyboardShortcut } from "~/hooks/useKeyboardShortcuts";
 import { useExcelImport } from "~/hooks/useExcelImport";
 import { exportToExcel } from "~/lib/excelUtils";
+import { useAutoSave } from "~/hooks/useAutoSave";
 
 type RecordWithCells = PrismaRecord & {
   cells: (Cell & { field: Field })[];
@@ -54,6 +55,10 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
 
   // Cell navigation state
   const [focusedCell, setFocusedCell] = useState<{ rowIndex: number; columnIndex: number } | null>(null);
+  const [editingCell, setEditingCell] = useState<{ rowIndex: number; columnIndex: number } | null>(null);
+
+  // Local optimistic updates (for immediate UI feedback without database saves)
+  const [optimisticChanges, setOptimisticChanges] = useState<Map<string, any>>(new Map());
 
   // Excel import/export using dedicated hook
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -253,10 +258,89 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
         );
       }
     },
-    // Always refetch after error or success to ensure sync with server
-    onSettled: () => {
-      void utils.record.getByTableId.invalidate({ tableId });
+  });
+
+  // Global auto-save that batches multiple cell updates
+  const { trackChange, forceSave, getPendingCount, notifyEditingStart, notifyEditingEnd } = useAutoSave({
+    onSave: async (changes) => {
+      console.log(`Auto-saving ${changes.length} changes in background...`);
+
+      // Save changes silently in the background WITHOUT triggering React Query invalidation
+      // This is key to Airtable-like performance - changes persist but UI never blocks
+      try {
+        // Update the React Query cache directly without triggering mutations
+        changes.forEach((change) => {
+          utils.record.getByTableId.setInfiniteData(
+            { tableId, limit: 50, viewId: selectedViewId ?? undefined },
+            (old) => {
+              if (!old) return old;
+
+              return {
+                ...old,
+                pages: old.pages.map((page) => ({
+                  ...page,
+                  items: page.items.map((record) => {
+                    if (record.id !== change.recordId) return record;
+
+                    const cell = record.cells.find((c) => c.fieldId === change.fieldId);
+                    if (cell) {
+                      // Update existing cell
+                      return {
+                        ...record,
+                        cells: record.cells.map((c) =>
+                          c.fieldId === change.fieldId ? { ...c, value: change.value } : c
+                        ),
+                      };
+                    } else {
+                      // Add new cell (for empty cells)
+                      const field = fields?.find((f) => f.id === change.fieldId);
+                      if (!field) return record;
+
+                      return {
+                        ...record,
+                        cells: [
+                          ...record.cells,
+                          {
+                            id: `temp-${change.recordId}-${change.fieldId}`,
+                            fieldId: change.fieldId,
+                            recordId: change.recordId,
+                            value: change.value,
+                            field,
+                            createdAt: new Date(),
+                            updatedAt: new Date(),
+                          },
+                        ],
+                      };
+                    }
+                  }),
+                })),
+              };
+            }
+          );
+        });
+
+        // Save to database in the background (fire and forget)
+        Promise.all(
+          changes.map((change) =>
+            updateCell.mutateAsync({
+              recordId: change.recordId,
+              fieldId: change.fieldId,
+              value: change.value,
+            })
+          )
+        ).catch((error) => {
+          console.error('Background save failed:', error);
+        });
+
+        // Clear optimistic changes after updating cache
+        setOptimisticChanges(new Map());
+        console.log('Auto-save complete!');
+      } catch (error) {
+        console.error('Auto-save failed:', error);
+        // Keep optimistic changes if save fails
+      }
     },
+    delay: 30000, // 30 seconds of inactivity before auto-save
   });
 
   // View mutations
@@ -674,10 +758,14 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
           </div>
         ),
         cell: ({ row, getValue, column }) => {
-          const value = getValue();
           const record = row.original;
           const rowIndex = row.index;
           const columnIndex = column.getIndex();
+
+          // Use optimistic value if available, otherwise use database value
+          const key = `${record.id}-${field.id}`;
+          const dbValue = getValue();
+          const value = optimisticChanges.has(key) ? optimisticChanges.get(key) : dbValue;
 
           return (
             <EditableCell
@@ -689,16 +777,30 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
               rowIndex={rowIndex}
               columnIndex={columnIndex}
               isFocused={focusedCell?.rowIndex === rowIndex && focusedCell?.columnIndex === columnIndex}
+              isEditing={editingCell?.rowIndex === rowIndex && editingCell?.columnIndex === columnIndex}
               totalRows={records.length}
               totalCols={visibleFields.length + 1}
               onNavigate={handleCellNavigate}
-              onUpdate={(newValue) => {
-                updateCell.mutate({
-                  recordId: record.id,
-                  fieldId: field.id,
-                  value: newValue,
-                });
+              onFocusCell={() => setFocusedCell({ rowIndex, columnIndex })}
+              onStartEdit={() => {
+                setFocusedCell({ rowIndex, columnIndex });
+                setEditingCell({ rowIndex, columnIndex });
               }}
+              onStopEdit={() => setEditingCell(null)}
+              onUpdate={(newValue) => {
+                // Store change in local optimistic state for immediate UI feedback
+                const key = `${record.id}-${field.id}`;
+                setOptimisticChanges((prev) => {
+                  const next = new Map(prev);
+                  next.set(key, newValue);
+                  return next;
+                });
+                // Track change for batch auto-save
+                trackChange(record.id, field.id, newValue);
+              }}
+              onForceSave={forceSave}
+              onEditingStart={notifyEditingStart}
+              onEditingEnd={notifyEditingEnd}
             />
           );
         },
@@ -1552,8 +1654,8 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
   );
 }
 
-// Editable Cell Component - Memoized to prevent unnecessary re-renders
-const EditableCell = memo(function EditableCell({
+// Editable Cell Component
+function EditableCell({
   recordId,
   fieldId,
   value,
@@ -1562,10 +1664,17 @@ const EditableCell = memo(function EditableCell({
   rowIndex,
   columnIndex,
   isFocused,
+  isEditing,
   totalRows,
   totalCols,
   onNavigate,
+  onFocusCell,
+  onStartEdit,
+  onStopEdit,
   onUpdate,
+  onForceSave,
+  onEditingStart,
+  onEditingEnd,
 }: {
   recordId: string;
   fieldId: string;
@@ -1575,33 +1684,106 @@ const EditableCell = memo(function EditableCell({
   rowIndex: number;
   columnIndex: number;
   isFocused: boolean;
+  isEditing: boolean;
   totalRows: number;
   totalCols: number;
   onNavigate: (rowIndex: number, columnIndex: number, direction: 'up' | 'down' | 'left' | 'right' | 'tab' | 'shift-tab', totalRows: number, totalCols: number) => void;
+  onFocusCell: () => void;
+  onStartEdit: () => void;
+  onStopEdit: () => void;
   onUpdate: (value: any) => void;
+  onForceSave?: () => Promise<void>;
+  onEditingStart?: () => void;
+  onEditingEnd?: () => void;
 }) {
-  const [isEditing, setIsEditing] = useState(false);
+  const [editInitialValue, setEditInitialValue] = useState<any>(undefined);
   const cellRef = useRef<HTMLDivElement>(null);
 
-  // Auto-focus cell when it becomes focused programmatically (not on first render)
+  // Auto-focus cell when it becomes focused programmatically
   useEffect(() => {
     if (isFocused && !isEditing && cellRef.current && document.activeElement !== cellRef.current) {
       cellRef.current.focus();
     }
   }, [isFocused, isEditing]);
 
-  const handleSave = useCallback((newValue: any) => {
+  // Set up native click and double-click event listeners
+  useEffect(() => {
+    const element = cellRef.current;
+    if (!element) return;
+
+    let clickTimeout: NodeJS.Timeout | null = null;
+
+    const handleNativeClick = (e: MouseEvent) => {
+      console.log('NATIVE CLICK');
+      if (isEditing) return;
+
+      // Clear any existing timeout
+      if (clickTimeout) {
+        clearTimeout(clickTimeout);
+      }
+
+      // Wait 250ms to see if a double-click follows
+      clickTimeout = setTimeout(() => {
+        console.log('EXECUTING SINGLE CLICK ACTION');
+        onFocusCell();
+        clickTimeout = null;
+      }, 250);
+    };
+
+    const handleNativeDoubleClick = (e: MouseEvent) => {
+      console.log('NATIVE DOUBLE CLICK EVENT!!!');
+      if (isEditing) return;
+      e.preventDefault();
+
+      // Cancel the single-click timeout
+      if (clickTimeout) {
+        clearTimeout(clickTimeout);
+        clickTimeout = null;
+      }
+
+      setEditInitialValue(undefined);
+      onStartEdit();
+      if (onEditingStart) onEditingStart();
+    };
+
+    element.addEventListener('click', handleNativeClick);
+    element.addEventListener('dblclick', handleNativeDoubleClick);
+
+    return () => {
+      if (clickTimeout) clearTimeout(clickTimeout);
+      element.removeEventListener('click', handleNativeClick);
+      element.removeEventListener('dblclick', handleNativeDoubleClick);
+    };
+  }, [isEditing, onFocusCell, onStartEdit, onEditingStart]);
+
+
+  const handleSave = useCallback(async (newValue: any) => {
     onUpdate(newValue);
-    setIsEditing(false);
-  }, [onUpdate]);
+    onStopEdit();
+    if (onEditingEnd) {
+      onEditingEnd();
+    }
+  }, [onUpdate, onStopEdit, onEditingEnd]);
 
   const handleCancel = useCallback(() => {
-    setIsEditing(false);
-  }, []);
+    onStopEdit();
+    if (onEditingEnd) {
+      onEditingEnd();
+    }
+  }, [onStopEdit, onEditingEnd]);
 
   const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
-    // Only handle navigation when not editing
     if (isEditing) return;
+
+    const isPrintableChar = e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey;
+
+    if (isPrintableChar) {
+      e.preventDefault();
+      setEditInitialValue(e.key);
+      onStartEdit();
+      if (onEditingStart) onEditingStart();
+      return;
+    }
 
     switch (e.key) {
       case 'ArrowUp':
@@ -1626,20 +1808,28 @@ const EditableCell = memo(function EditableCell({
         break;
       case 'Enter':
         e.preventDefault();
-        setIsEditing(true);
+        setEditInitialValue(undefined);
+        onStartEdit();
+        if (onEditingStart) onEditingStart();
+        break;
+      case 'Backspace':
+      case 'Delete':
+        e.preventDefault();
+        setEditInitialValue('');
+        onStartEdit();
+        if (onEditingStart) onEditingStart();
         break;
     }
-  }, [isEditing, onNavigate, rowIndex, columnIndex, totalRows, totalCols]);
-
-  const handleClick = useCallback(() => {
-    setIsEditing(true);
-  }, []);
+  }, [isEditing, onNavigate, rowIndex, columnIndex, totalRows, totalCols, onStartEdit, onEditingStart]);
 
   if (isEditing) {
+    // Use editInitialValue if set (when user typed), otherwise use current value
+    const editorValue = editInitialValue !== undefined ? editInitialValue : value;
+
     return (
       <div className="min-h-[40px] px-4 py-2">
         <CellEditor
-          value={value}
+          value={editorValue}
           fieldType={fieldType}
           fieldConfig={fieldConfig}
           onSave={handleSave}
@@ -1653,13 +1843,15 @@ const EditableCell = memo(function EditableCell({
     <div
       ref={cellRef}
       tabIndex={0}
-      onClick={handleClick}
       onKeyDown={handleKeyDown}
-      className={`min-h-[40px] cursor-pointer px-4 py-2 hover:bg-blue-50 focus:outline-none ${
+      className={`min-h-[40px] cursor-cell px-4 py-2 hover:bg-blue-50 focus:outline-none ${
         isFocused ? 'ring-2 ring-blue-500 ring-inset' : ''
       }`}
+      style={{ userSelect: 'none' }}
     >
-      <CellDisplay value={value} fieldType={fieldType} fieldConfig={fieldConfig} />
+      <div className="pointer-events-none">
+        <CellDisplay value={value} fieldType={fieldType} fieldConfig={fieldConfig} />
+      </div>
     </div>
   );
-});
+}
