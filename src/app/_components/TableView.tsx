@@ -840,6 +840,9 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
     getScrollElement: () => tableContainerRef.current,
     estimateSize: () => 40, // Estimated row height in pixels
     overscan: 10, // Render 10 extra rows above and below viewport for smooth scrolling
+    // Note: flushSync warning from TanStack Virtual is a known issue with React 19
+    // See: https://github.com/TanStack/virtual/issues/642
+    // This doesn't affect functionality, just logs a warning
   });
 
   if (!base || !table) {
