@@ -472,7 +472,7 @@ export default function TestPage() {
                     <span className="font-bold">{filter.field.name}</span>
                     <span className="ml-2 text-gray-400">{filter.operator}</span>
                     {filter.value && (
-                      <span className="ml-2 text-gray-300">&quot;{filter.value}&quot;</span>
+                      <span className="ml-2 text-gray-300">&quot;{JSON.stringify(filter.value)}&quot;</span>
                     )}
                   </div>
                   <button

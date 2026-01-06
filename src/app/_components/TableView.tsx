@@ -1361,9 +1361,9 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
               ) : (
                 <>
                   {/* Spacer for rows above viewport */}
-                  {rowVirtualizer.getVirtualItems()[0] && rowVirtualizer.getVirtualItems()[0].start > 0 && (
+                  {(rowVirtualizer.getVirtualItems()[0]?.start ?? 0) > 0 && (
                     <tr>
-                      <td colSpan={columns.length} style={{ height: `${rowVirtualizer.getVirtualItems()[0].start}px` }} />
+                      <td colSpan={columns.length} style={{ height: `${rowVirtualizer.getVirtualItems()[0]?.start ?? 0}px` }} />
                     </tr>
                   )}
 

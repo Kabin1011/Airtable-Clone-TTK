@@ -83,9 +83,6 @@ export const cellRouter = createTRPCRouter({
               },
             }),
           ),
-          {
-            timeout: 10000, // 10 second timeout for large batches
-          }
         );
         results.push(...batchResults);
       }
