@@ -219,7 +219,7 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
                     ...record,
                     cells: record.cells.map((cell) => {
                       if (cell.fieldId !== newData.fieldId) return cell;
-                      return { ...cell, value: newData.value };
+                      return { ...cell, value: newData.value, updatedAt: new Date() };
                     }),
                   };
                 } else if (field) {
