@@ -233,6 +233,8 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
                         fieldId: newData.fieldId,
                         recordId: newData.recordId,
                         value: newData.value,
+                        createdAt: new Date(),
+                        updatedAt: new Date(),
                         field,
                       },
                     ],
