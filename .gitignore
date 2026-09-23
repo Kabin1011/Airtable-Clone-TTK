@@ -47,3 +47,9 @@ yarn-error.log*
 
 # instruction:
 .claude
+# env backups (may contain real credentials)
+.env*.bak
+*.bak
+
+# prisma engine temp files
+generated/prisma/*.tmp*
