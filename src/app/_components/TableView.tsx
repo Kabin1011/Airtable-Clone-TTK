@@ -18,7 +18,6 @@ import { CellEditor } from "./cells/CellEditor";
 import { FIELD_TYPE_CONFIGS } from "~/lib/fieldTypes";
 import { useKeyboardShortcuts, type KeyboardShortcut } from "~/hooks/useKeyboardShortcuts";
 import { useExcelImport } from "~/hooks/useExcelImport";
-import { exportToExcel } from "~/lib/excelUtils";
 import { useAutoSave } from "~/hooks/useAutoSave";
 
 type GridRow = RouterOutputs["record"]["getRows"][number];
@@ -325,7 +324,7 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
   });
 
   // Global auto-save that batches multiple cell updates
-  const { trackChange, getPendingCount, notifyEditingStart, notifyEditingEnd } = useAutoSave({
+  const { trackChange, forceSave, getPendingCount, notifyEditingStart, notifyEditingEnd } = useAutoSave({
     onSave: async (changes) => {
       console.log(`Auto-saving ${changes.length} changes in background...`);
 
@@ -337,8 +336,13 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
           patchCachedRows(change.recordId, withCellValue(change.fieldId, change.value));
         });
 
-        // Save to database in the background (fire and forget)
-        Promise.all(
+        // Clear optimistic changes after updating cache
+        setOptimisticChanges(new Map());
+
+        // Save to database. Awaited so forceSave() resolves only once the
+        // writes have landed (export relies on this); the timer-driven save
+        // doesn't await onSave, so this still never blocks the UI.
+        await Promise.all(
           changes.map((change) =>
             updateCell.mutateAsync({
               recordId: change.recordId,
@@ -349,9 +353,6 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
         ).catch((error) => {
           console.error('Background save failed:', error);
         });
-
-        // Clear optimistic changes after updating cache
-        setOptimisticChanges(new Map());
         console.log('Auto-save complete!');
       } catch (error) {
         console.error('Auto-save failed:', error);
@@ -635,33 +636,36 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
     }
   }, [importExcel]);
 
-  // Handle Excel export
-  const handleExport = useCallback(() => {
-    if (!fields || !records) return;
+  // Handle Excel export. The grid only holds the pages around the viewport,
+  // so the file is built server-side from the view's full result set
+  // (filters, sort order and hidden fields applied).
+  const [isExporting, setIsExporting] = useState(false);
+  const handleExport = useCallback(async () => {
+    setIsExporting(true);
+    try {
+      // Edits wait up to 30s in the auto-save queue; flush them first so the
+      // export includes everything the user sees.
+      await forceSave();
 
-    // Get visible fields
-    const hiddenFieldIds = new Set(
-      currentView?.hiddenFields?.map((hf) => hf.fieldId) ?? []
-    );
-    const visibleFields = fields.filter((f) => !hiddenFieldIds.has(f.id));
+      const query = viewId ? `?viewId=${encodeURIComponent(viewId)}` : '';
+      const response = await fetch(`/api/tables/${encodeURIComponent(tableId)}/export${query}`);
+      if (!response.ok) throw new Error((await response.text()) || `Export failed (${response.status})`);
 
-    // Convert records to export format
-    const exportData = records.map((record) => {
-      const rowData: Record<string, any> = {};
-
-      for (const field of visibleFields) {
-        rowData[field.name] = record.cellsByFieldId.get(field.id)?.value ?? null;
-      }
-
-      return rowData;
-    });
-
-    // Generate filename with table name and timestamp
-    const timestamp = new Date().toISOString().split('T')[0];
-    const filename = `${table?.name || 'table'}_${timestamp}.xlsx`;
-
-    exportToExcel(exportData, visibleFields, filename);
-  }, [fields, records, currentView, table]);
+      // Trigger the download
+      const url = URL.createObjectURL(await response.blob());
+      const link = document.createElement('a');
+      link.href = url;
+      // en-CA formats as YYYY-MM-DD, in the user's local time zone
+      link.download = `${table?.name ?? 'table'}_${new Date().toLocaleDateString('en-CA')}.xlsx`;
+      link.click();
+      setTimeout(() => URL.revokeObjectURL(url), 0);
+    } catch (error) {
+      console.error('Export failed:', error);
+      alert(error instanceof Error ? error.message : 'Export failed');
+    } finally {
+      setIsExporting(false);
+    }
+  }, [forceSave, viewId, tableId, table?.name]);
 
   // Fields shown in the current view, in order. Body column i + 1 is
   // visibleFields[i]; column 0 is the row number.
@@ -1061,15 +1065,15 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
                 {isImporting ? 'Importing...' : 'Import'}
               </button>
               <button
-                onClick={handleExport}
-                disabled={!records || records.length === 0}
+                onClick={() => void handleExport()}
+                disabled={!totalRowsData || isExporting}
                 className="flex items-center gap-1.5 rounded px-3 py-1.5 text-sm font-medium text-gray-700 hover:bg-gray-100 disabled:opacity-50"
                 title="Export to Excel"
               >
                 <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M9 19l3 3m0 0l3-3m-3 3V10" />
                 </svg>
-                Export
+                {isExporting ? 'Exporting...' : 'Export'}
               </button>
             </div>
 

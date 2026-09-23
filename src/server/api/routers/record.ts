@@ -94,16 +94,19 @@ function buildSortJoinAndExpr(sort: SortWithField, alias: string): { join: Prism
 export type GridCell = { fieldId: string; value: Prisma.JsonValue };
 export type GridRow = { id: string; order: number; cells: GridCell[] };
 
-async function loadViewConfig(db: typeof Db, viewId: string | undefined) {
+export async function loadViewConfig(db: typeof Db, viewId: string | undefined) {
     if (!viewId) return null;
     return db.view.findUnique({
         where: { id: viewId },
         include: {
             filters: { orderBy: { order: "asc" }, include: { field: true } },
             sorts: { orderBy: { order: "asc" }, include: { field: true } },
+            hiddenFields: { select: { fieldId: true } },
         },
     });
 }
+
+export type ViewConfig = Awaited<ReturnType<typeof loadViewConfig>>;
 
 function buildWhereClause(tableId: string, filters: FilterWithField[]): Prisma.Sql {
     return Prisma.join(
@@ -130,6 +133,101 @@ function selectRowsWithCells(pageQuery: Prisma.Sql): Prisma.Sql {
     `;
 }
 
+// Same as selectRowsWithCells but aggregates each row's cells into a single
+// { fieldId: value } object, which is ~35% faster to build and parse than an
+// array of { fieldId, value } objects. Used by the export, which reads every
+// row of the view.
+function selectRowValues(pageQuery: Prisma.Sql): Prisma.Sql {
+    return Prisma.sql`
+        SELECT p.id,
+            COALESCE(
+                (SELECT jsonb_object_agg(c."fieldId", c.value)
+                 FROM "Cell" c WHERE c."recordId" = p.id),
+                '{}'::jsonb
+            ) AS "values"
+        FROM (${pageQuery}) p
+        ORDER BY p.rn
+    `;
+}
+
+// Subquery selecting (id, order, rn) for rows [offset, offset + limit) of a
+// view's filtered + sorted result set; rn is the sort key for the outer query.
+function buildViewPageQuery(tableId: string, view: ViewConfig, offset: number, limit: number): Prisma.Sql {
+    const filters = view?.filters ?? [];
+    const sorts = view?.sorts ?? [];
+
+    if (filters.length === 0 && sorts.length === 0) {
+        // Seek, don't skip: find the "order" value at the offset with an
+        // index-only scan over (tableId, order), then range-scan forward
+        // from it. A plain OFFSET would fetch every skipped row from the
+        // heap, so deep pages (row 99,900 of 100K) got linearly slower.
+        // Relies on "order" being unique within a table, which create /
+        // bulkCreate guarantee by always allocating max(order) + 1 upward.
+        return Prisma.sql`
+            SELECT r.id, r."order", r."order" AS rn
+            FROM "Record" r
+            WHERE r."tableId" = ${tableId}
+              AND r."order" >= (
+                  SELECT "order" FROM "Record"
+                  WHERE "tableId" = ${tableId}
+                  ORDER BY "order"
+                  OFFSET ${offset} LIMIT 1
+              )
+            ORDER BY r."order"
+            LIMIT ${limit}
+        `;
+    }
+
+    // Filtered/sorted path: the sort needs the whole filtered set ordered
+    // anyway, so OFFSET is unavoidable here; rn preserves that order
+    // through the outer cell-aggregating query.
+    const sortJoinsAndExprs = sorts.map((s, i) => buildSortJoinAndExpr(s, `s${i}`));
+    const joinClause = sortJoinsAndExprs.length
+        ? Prisma.join(sortJoinsAndExprs.map((j) => j.join), " ")
+        : Prisma.empty;
+    const orderByClause = Prisma.join(
+        [...sortJoinsAndExprs.map((j) => j.orderExpr), Prisma.sql`r."order" ASC`],
+        ", ",
+    );
+
+    return Prisma.sql`
+        SELECT r.id, r."order", row_number() OVER (ORDER BY ${orderByClause}) AS rn
+        FROM "Record" r
+        ${joinClause}
+        WHERE ${buildWhereClause(tableId, filters)}
+        ORDER BY ${orderByClause}
+        LIMIT ${limit}
+        OFFSET ${offset}
+    `;
+}
+
+// Only $queryRaw is needed, so a transaction client works too.
+type RawQueryClient = Pick<typeof Db, "$queryRaw">;
+
+// Rows [offset, offset + limit) of a view's filtered + sorted result set, with
+// lean cells, for the grid.
+export async function queryViewRows(
+    db: RawQueryClient,
+    tableId: string,
+    view: ViewConfig,
+    offset: number,
+    limit: number,
+): Promise<GridRow[]> {
+    return db.$queryRaw<GridRow[]>(selectRowsWithCells(buildViewPageQuery(tableId, view, offset, limit)));
+}
+
+// The same rows as queryViewRows (same filters, same order), but with each
+// row's values as a { fieldId: value } map. Used by the full-view export.
+export async function queryViewRowValues(
+    db: RawQueryClient,
+    tableId: string,
+    view: ViewConfig,
+    offset: number,
+    limit: number,
+): Promise<{ id: string; values: Record<string, Prisma.JsonValue> }[]> {
+    return db.$queryRaw(selectRowValues(buildViewPageQuery(tableId, view, offset, limit)));
+}
+
 export const recordRouter = createTRPCRouter({
     // Random-access page fetch for the virtualized grid: rows
     // [offset, offset + limit) of the view's filtered + sorted result set.
@@ -145,52 +243,7 @@ export const recordRouter = createTRPCRouter({
     .query(async ({ ctx, input }): Promise<GridRow[]> => {
         const { tableId, viewId, offset, limit } = input;
         const view = await loadViewConfig(ctx.db, viewId);
-        const filters = view?.filters ?? [];
-        const sorts = view?.sorts ?? [];
-
-        if (filters.length === 0 && sorts.length === 0) {
-            // Seek, don't skip: find the "order" value at the offset with an
-            // index-only scan over (tableId, order), then range-scan forward
-            // from it. A plain OFFSET would fetch every skipped row from the
-            // heap, so deep pages (row 99,900 of 100K) got linearly slower.
-            // Relies on "order" being unique within a table, which create /
-            // bulkCreate guarantee by always allocating max(order) + 1 upward.
-            return ctx.db.$queryRaw<GridRow[]>(selectRowsWithCells(Prisma.sql`
-                SELECT r.id, r."order", r."order" AS rn
-                FROM "Record" r
-                WHERE r."tableId" = ${tableId}
-                  AND r."order" >= (
-                      SELECT "order" FROM "Record"
-                      WHERE "tableId" = ${tableId}
-                      ORDER BY "order"
-                      OFFSET ${offset} LIMIT 1
-                  )
-                ORDER BY r."order"
-                LIMIT ${limit}
-            `));
-        }
-
-        // Filtered/sorted path: the sort needs the whole filtered set ordered
-        // anyway, so OFFSET is unavoidable here; rn preserves that order
-        // through the outer cell-aggregating query.
-        const sortJoinsAndExprs = sorts.map((s, i) => buildSortJoinAndExpr(s, `s${i}`));
-        const joinClause = sortJoinsAndExprs.length
-            ? Prisma.join(sortJoinsAndExprs.map((j) => j.join), " ")
-            : Prisma.empty;
-        const orderByClause = Prisma.join(
-            [...sortJoinsAndExprs.map((j) => j.orderExpr), Prisma.sql`r."order" ASC`],
-            ", ",
-        );
-
-        return ctx.db.$queryRaw<GridRow[]>(selectRowsWithCells(Prisma.sql`
-            SELECT r.id, r."order", row_number() OVER (ORDER BY ${orderByClause}) AS rn
-            FROM "Record" r
-            ${joinClause}
-            WHERE ${buildWhereClause(tableId, filters)}
-            ORDER BY ${orderByClause}
-            LIMIT ${limit}
-            OFFSET ${offset}
-        `));
+        return queryViewRows(ctx.db, tableId, view, offset, limit);
     }),
 
     // Row count after the view's filters, which sizes the grid's scrollbar.

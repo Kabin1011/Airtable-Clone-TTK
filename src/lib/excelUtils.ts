@@ -1,4 +1,3 @@
-import * as XLSX from 'xlsx';
 import type { FieldType } from "../../generated/prisma";
 import { parseExcelWorkbook, type ExcelImportResult, type ExcelWorkerResponse } from './excelParse';
 
@@ -43,70 +42,6 @@ export async function importFromExcel(file: File): Promise<ExcelImportResult> {
     // for the fallback above.
     worker.postMessage(data);
   });
-}
-
-/**
- * Export data to Excel file
- */
-export function exportToExcel(
-  data: Array<Record<string, any>>,
-  fields: Array<{ name: string; type: FieldType }>,
-  filename: string = 'export.xlsx'
-) {
-  // Create headers
-  const headers = fields.map((field) => field.name);
-
-  // Convert data to array format
-  const rows = data.map((record) => {
-    return fields.map((field) => {
-      const value = record[field.name];
-
-      // Format based on field type
-      switch (field.type) {
-        case 'DATE':
-          return value ? new Date(value) : null;
-        case 'CHECKBOX':
-          return value ? 'Yes' : 'No';
-        case 'NUMBER':
-          return value !== null && value !== undefined ? Number(value) : null;
-        case 'ATTACHMENT':
-          // For attachments, export the URLs
-          return Array.isArray(value) ? value.map((v: any) => v.url).join(', ') : value;
-        case 'SELECT':
-        case 'MULTI_SELECT':
-          return Array.isArray(value) ? value.join(', ') : value;
-        default:
-          return value ?? '';
-      }
-    });
-  });
-
-  // Combine headers and rows
-  const worksheetData = [headers, ...rows];
-
-  // Create worksheet
-  const worksheet = XLSX.utils.aoa_to_sheet(worksheetData);
-
-  // Auto-size columns
-  const maxWidths = headers.map((header, colIndex) => {
-    const headerWidth = header.length;
-    const dataWidths = rows.map((row) => {
-      const cellValue = String(row[colIndex] ?? '');
-      return cellValue.length;
-    });
-    return Math.max(headerWidth, ...dataWidths, 10); // Min width of 10
-  });
-
-  worksheet['!cols'] = maxWidths.map((width) => ({
-    wch: Math.min(width, 50), // Max width of 50
-  }));
-
-  // Create workbook
-  const workbook = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(workbook, worksheet, 'Sheet1');
-
-  // Generate Excel file and trigger download
-  XLSX.writeFile(workbook, filename);
 }
 
 /**
