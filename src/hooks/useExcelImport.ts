@@ -17,7 +17,8 @@ export function useExcelImport(tableId: string) {
       // Invalidate queries to refresh the UI with new data
       await Promise.all([
         utils.field.getByTableId.invalidate({ tableId }),
-        utils.record.getByTableId.invalidate({ tableId }),
+        utils.record.getRows.invalidate({ tableId }),
+        utils.record.countForView.invalidate({ tableId }),
       ]);
     },
   });

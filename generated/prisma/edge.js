@@ -257,7 +257,7 @@ const config = {
       "value": "prisma-client-js"
     },
     "output": {
-      "value": "C:\\Users\\Khanh\\OneDrive - z55rs\\Documents\\Monash\\Self Project\\Airtable Clone\\Airtable-Clone-TTK\\generated\\prisma",
+      "value": "C:\\Users\\Kabin\\Monash\\Self Project\\Airtable Clone\\Airtable-Clone-TTK\\generated\\prisma",
       "fromEnvVar": null
     },
     "config": {
@@ -271,7 +271,7 @@ const config = {
       }
     ],
     "previewFeatures": [],
-    "sourceFilePath": "C:\\Users\\Khanh\\OneDrive - z55rs\\Documents\\Monash\\Self Project\\Airtable Clone\\Airtable-Clone-TTK\\prisma\\schema.prisma",
+    "sourceFilePath": "C:\\Users\\Kabin\\Monash\\Self Project\\Airtable Clone\\Airtable-Clone-TTK\\prisma\\schema.prisma",
     "isCustomOutput": true
   },
   "relativeEnvPaths": {

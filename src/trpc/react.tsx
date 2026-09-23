@@ -1,10 +1,10 @@
 "use client";
 
 import { QueryClientProvider, type QueryClient } from "@tanstack/react-query";
-import { httpBatchStreamLink } from "@trpc/client";
+import { httpBatchLink } from "@trpc/client";
 import { createTRPCReact } from "@trpc/react-query";
 import { type inferRouterInputs, type inferRouterOutputs } from "@trpc/server";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import SuperJSON from "superjson";
 
 import { type AppRouter } from "~/server/api/root";
@@ -41,6 +41,22 @@ export type RouterOutputs = inferRouterOutputs<AppRouter>;
 export function TRPCReactProvider(props: { children: React.ReactNode }) {
   const queryClient = getQueryClient();
 
+  useEffect(() => {
+    // Optimistic updates cancel in-flight queries (queryClient.cancelQueries),
+    // which rejects the underlying fetch with an AbortError. This is expected
+    // and normally handled internally, but can still surface as an unhandled
+    // rejection depending on timing - swallow it so it doesn't hit the
+    // Next.js error overlay/error boundary.
+    const onUnhandledRejection = (event: PromiseRejectionEvent) => {
+      if (event.reason instanceof Error && event.reason.name === "AbortError") {
+        event.preventDefault();
+      }
+    };
+    window.addEventListener("unhandledrejection", onUnhandledRejection);
+    return () =>
+      window.removeEventListener("unhandledrejection", onUnhandledRejection);
+  }, []);
+
   const [trpcClient] = useState(() =>
     api.createClient({
       links: [
@@ -50,7 +66,7 @@ export function TRPCReactProvider(props: { children: React.ReactNode }) {
         //     // Only log errors, not all operations
         //     op.direction === "down" && op.result instanceof Error,
         // }),
-        httpBatchStreamLink({
+        httpBatchLink({
           transformer: SuperJSON,
           url: getBaseUrl() + "/api/trpc",
           headers: () => {

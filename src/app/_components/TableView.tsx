@@ -1,16 +1,19 @@
 "use client";
 
-import { useState, useMemo, useRef, useEffect, useCallback } from "react";
-import { api } from "~/trpc/react";
+import { useState, useMemo, useRef, useEffect, useCallback, memo } from "react";
+import { useQueryClient } from "@tanstack/react-query";
+import { getQueryKey } from "@trpc/react-query";
+import { api, type RouterOutputs } from "~/trpc/react";
 import Link from "next/link";
 import {
   useReactTable,
   getCoreRowModel,
   flexRender,
   type ColumnDef,
+  type Row,
 } from "@tanstack/react-table";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import type { Field, Record as PrismaRecord, Cell, FieldType } from "../../../generated/prisma";
+import type { FieldType } from "../../../generated/prisma";
 import { CellDisplay } from "./cells/CellDisplay";
 import { CellEditor } from "./cells/CellEditor";
 import { FIELD_TYPE_CONFIGS } from "~/lib/fieldTypes";
@@ -19,9 +22,59 @@ import { useExcelImport } from "~/hooks/useExcelImport";
 import { exportToExcel } from "~/lib/excelUtils";
 import { useAutoSave } from "~/hooks/useAutoSave";
 
-type RecordWithCells = PrismaRecord & {
-  cells: (Cell & { field: Field })[];
+type GridRow = RouterOutputs["record"]["getRows"][number];
+type GridCell = GridRow["cells"][number];
+
+// A loaded grid row plus its absolute position in the view's result set
+// (rows are fetched in independent pages, so the position can't be derived
+// from an index into the loaded array) and an O(1) fieldId -> cell lookup.
+type RecordWithCellMap = GridRow & {
+  absIndex: number;
+  cellsByFieldId: Map<string, GridCell>;
 };
+
+// Returns a record updater that sets one cell's value, creating the cell
+// if the record had no value for that field yet.
+function withCellValue(fieldId: string, value: unknown) {
+  return (record: GridRow): GridRow => {
+    const cellValue = value as GridCell["value"];
+    return record.cells.some((c) => c.fieldId === fieldId)
+      ? { ...record, cells: record.cells.map((c) => (c.fieldId === fieldId ? { ...c, value: cellValue } : c)) }
+      : { ...record, cells: [...record.cells, { fieldId, value: cellValue }] };
+  };
+}
+
+// Absolute row index (position in the view's full result set) + column index.
+type CellPosition = { rowIndex: number; columnIndex: number };
+
+// Interaction state that changes on every click/keystroke/scroll-slide.
+// Passed to useReactTable as `meta` instead of being closed over by the
+// `columns` memo, so it can update every render without forcing the memo to
+// rebuild (which would force TanStack Table to reprocess every loaded row,
+// not just the one whose focus/value actually changed).
+type TableMeta = {
+  focusedCell: CellPosition | null;
+  editingCell: CellPosition | null;
+  optimisticChanges: Map<string, unknown>;
+  totalRows: number;
+};
+
+// Rows are fetched as independent fixed-size pages keyed by page index, and
+// the virtualizer is sized to the view's full row count, so the scrollbar
+// covers the whole table and any position can be jumped to directly.
+const PAGE_SIZE = 100;
+// Extra rows (beyond the virtualizer's overscan) to have loaded in each
+// direction, so the next page is usually already in cache when scrolled to.
+const PREFETCH_ROWS = PAGE_SIZE;
+// Pages that scroll out of the prefetch range lose their observer; after this
+// long unobserved they're garbage-collected, which is what evicts scrolled-past
+// rows in both directions. Scrolling back within the window is a cache hit.
+const PAGE_GC_TIME = 30_000;
+// A scrollbar drag can cross dozens of pages in a moment. Wait until a
+// non-contiguous jump settles for this long before fetching, instead of
+// requesting every page flown past.
+const JUMP_SETTLE_MS = 120;
+const ROW_HEIGHT = 40; // must match rowVirtualizer's estimateSize below
 
 export function TableView({ baseId, tableId }: { baseId: string; tableId: string }) {
   const [isCreatingField, setIsCreatingField] = useState(false);
@@ -73,8 +126,16 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
   // Fetch views for this table
   const { data: views } = api.view.getByTableId.useQuery({ tableId }, { enabled: !!tableId });
 
-  // Auto-select first view or default view
-  useMemo(() => {
+  // Auto-select first view or default view.
+  // This must be a useEffect, not useMemo: useMemo runs its callback
+  // synchronously during render, so calling setSelectedViewId in it is a
+  // render-phase state update — React re-renders immediately to reflect it,
+  // and if that doesn't converge before the guard re-checks (e.g. `views`
+  // getting a new array reference on a render triggered by something else),
+  // it can hit React's "Too many re-renders" render-loop limit. useEffect
+  // defers the update to the commit phase, which is the correct place for
+  // this kind of derived-state side effect.
+  useEffect(() => {
     if (views && views.length > 0 && !selectedViewId) {
       const defaultView = views.find(v => v.isDefault) || views[0];
       if (defaultView) setSelectedViewId(defaultView.id);
@@ -84,32 +145,111 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
   // Get current view data
   const currentView = views?.find(v => v.id === selectedViewId);
 
-  // Use infinite query for pagination
-  const {
-    data: infiniteData,
-    fetchNextPage,
-    hasNextPage,
-    isFetchingNextPage,
-    isLoading,
-    isFetching,
-  } = api.record.getByTableId.useInfiniteQuery(
-    { tableId, limit: 50, viewId: selectedViewId ?? undefined },
-    {
-      getNextPageParam: (lastPage) => lastPage.nextCursor,
-      enabled: !!tableId,
-      placeholderData: (previousData) => previousData, // Keep previous data while loading new data
-    }
-  );
+  const viewId = selectedViewId ?? undefined;
+  // Don't fetch rows until the default view is chosen, otherwise the first
+  // round of requests goes out for "no view" and is immediately thrown away.
+  const isViewResolved = views !== undefined && (views.length === 0 || !!selectedViewId);
 
-  // Flatten all pages into a single array
-  const records = useMemo(() => {
-    return infiniteData?.pages.flatMap((page) => page.items) ?? [];
-  }, [infiniteData]);
+  // Total rows in the view (after filters). This sizes the virtualizer, so
+  // the scrollbar represents the whole table rather than just loaded rows.
+  const { data: totalRowsData } = api.record.countForView.useQuery(
+    { tableId, viewId },
+    { enabled: !!tableId && isViewResolved },
+  );
+  const totalRows = totalRowsData ?? 0;
+  // Until the count arrives, still fetch page 0 so both requests run in parallel.
+  const lastPageIndex = totalRowsData === undefined ? 0 : Math.ceil(totalRows / PAGE_SIZE) - 1;
+
+  // Inclusive range of page indexes that should be loaded. Driven by the
+  // virtualizer's visible range (see the effect after rowVirtualizer).
+  const [pageRange, setPageRange] = useState({ first: 0, last: 0 });
+  const pageIndexes = useMemo(() => {
+    const pages: number[] = [];
+    for (let page = pageRange.first; page <= Math.min(pageRange.last, lastPageIndex); page++) pages.push(page);
+    return pages;
+  }, [pageRange, lastPageIndex]);
+
+  // One query per page. Only pages in pageIndexes are observed; the rest
+  // expire after PAGE_GC_TIME, so memory stays bounded to about the viewport
+  // plus the prefetch margin no matter how far the user scrolls.
+  const pageQueries = api.useQueries((t) =>
+    pageIndexes.map((page) =>
+      t.record.getRows(
+        { tableId, viewId, offset: page * PAGE_SIZE, limit: PAGE_SIZE },
+        { enabled: !!tableId && isViewResolved, gcTime: PAGE_GC_TIME },
+      ),
+    ),
+  );
+  const isFetchingRows = pageQueries.some((q) => q.isFetching);
+
+  // Flatten loaded pages into one array, tagging each record with its absolute
+  // row index and precomputing a fieldId -> cell Map so cell lookups
+  // (accessorFn + cell renderer, run for every visible cell on every render)
+  // are O(1). Built per page and cached by the page's data reference, so a
+  // newly loaded page or an edit in one page doesn't rebuild the others; and
+  // the flattened array keeps its identity until some page's data actually
+  // changes, so TanStack Table doesn't reprocess its row model every render.
+  const builtPagesRef = useRef(new WeakMap<GridRow[], RecordWithCellMap[]>());
+  const recordsRef = useRef<{ deps: unknown[]; records: RecordWithCellMap[] }>({ deps: [], records: [] });
+  const recordDeps = pageIndexes.flatMap((page, i) => [page, pageQueries[i]?.data]);
+  if (
+    recordDeps.length !== recordsRef.current.deps.length ||
+    recordDeps.some((dep, i) => dep !== recordsRef.current.deps[i])
+  ) {
+    recordsRef.current = {
+      deps: recordDeps,
+      records: pageIndexes.flatMap((page, i) => {
+        const data = pageQueries[i]?.data;
+        if (!data) return [];
+        let built = builtPagesRef.current.get(data);
+        if (!built) {
+          built = data.map((record, j) => ({
+            ...record,
+            absIndex: page * PAGE_SIZE + j,
+            cellsByFieldId: new Map(record.cells.map((c) => [c.fieldId, c])),
+          }));
+          builtPagesRef.current.set(data, built);
+        }
+        return built;
+      }),
+    };
+  }
+  const records = recordsRef.current.records;
+
+  // Cache helpers for page queries. Pages live under separate query keys, so
+  // optimistic edits patch every cached page of this table (a no-op for pages
+  // that don't contain the record, which keeps their data reference intact).
+  const queryClient = useQueryClient();
+  const rowsQueryFilter = useMemo(
+    () => ({ queryKey: getQueryKey(api.record.getRows, { tableId }, "query") }),
+    [tableId]
+  );
+  const patchCachedRows = useCallback(
+    (recordId: string, update: (record: GridRow) => GridRow | null) => {
+      queryClient.setQueriesData<GridRow[]>(rowsQueryFilter, (rows) => {
+        if (!rows?.some((r) => r.id === recordId)) return rows;
+        return rows.flatMap((r) => (r.id === recordId ? (update(r) ?? []) : [r]));
+      });
+    },
+    [queryClient, rowsQueryFilter]
+  );
+  const snapshotCachedRows = useCallback(() => {
+    const snapshot = queryClient.getQueriesData<GridRow[]>(rowsQueryFilter);
+    return () => snapshot.forEach(([key, data]) => queryClient.setQueryData(key, data));
+  }, [queryClient, rowsQueryFilter]);
+  const invalidateRows = useCallback(
+    () =>
+      Promise.all([
+        utils.record.getRows.invalidate({ tableId }),
+        utils.record.countForView.invalidate({ tableId }),
+      ]),
+    [utils, tableId]
+  );
 
   const createField = api.field.create.useMutation({
     onSuccess: async () => {
       await utils.field.getByTableId.invalidate({ tableId });
-      await utils.record.getByTableId.invalidate({ tableId });
+      await invalidateRows();
       setIsCreatingField(false);
       setNewFieldName("");
       setNewFieldType("TEXT");
@@ -120,7 +260,7 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
     onSuccess: async () => {
       await Promise.all([
         utils.field.getByTableId.invalidate({ tableId }),
-        utils.record.getByTableId.invalidate({ tableId }),
+        invalidateRows(),
       ]);
     },
   });
@@ -129,57 +269,35 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
     onSuccess: async () => {
       await Promise.all([
         utils.field.getByTableId.invalidate({ tableId }),
-        utils.record.getByTableId.invalidate({ tableId }),
+        invalidateRows(),
       ]);
     },
   });
 
   const createRecord = api.record.create.useMutation({
     onSuccess: async () => {
-      await utils.record.getByTableId.invalidate({ tableId });
+      await invalidateRows();
     },
   });
 
   const deleteRecord = api.record.delete.useMutation({
     onMutate: async (variables) => {
       // Cancel outgoing refetches
-      await utils.record.getByTableId.cancel({ tableId });
+      await queryClient.cancelQueries(rowsQueryFilter);
 
-      // Snapshot previous data
-      const previousData = utils.record.getByTableId.getInfiniteData({
-        tableId,
-        limit: 50,
-        viewId: selectedViewId ?? undefined
-      });
+      // Snapshot previous data, then optimistically remove the record. Rows
+      // after it in the same page shift up until the onSettled refetch
+      // re-aligns every page to the new offsets.
+      const rollback = snapshotCachedRows();
+      patchCachedRows(variables.id, () => null);
 
-      // Optimistically remove record from UI
-      utils.record.getByTableId.setInfiniteData(
-        { tableId, limit: 50, viewId: selectedViewId ?? undefined },
-        (old) => {
-          if (!old) return old;
-          return {
-            ...old,
-            pages: old.pages.map((page) => ({
-              ...page,
-              items: page.items.filter((record) => record.id !== variables.id),
-            })),
-          };
-        }
-      );
-
-      return { previousData };
+      return { rollback };
     },
     onError: (err, variables, context) => {
-      // Rollback on error
-      if (context?.previousData) {
-        utils.record.getByTableId.setInfiniteData(
-          { tableId, limit: 50, viewId: selectedViewId ?? undefined },
-          context.previousData
-        );
-      }
+      context?.rollback();
     },
     onSettled: () => {
-      void utils.record.getByTableId.invalidate({ tableId });
+      void invalidateRows();
     },
   });
 
@@ -187,78 +305,17 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
     // Optimistic update - update UI immediately without waiting for server
     onMutate: async (newData) => {
       // Cancel any outgoing refetches
-      await utils.record.getByTableId.cancel({ tableId });
+      await queryClient.cancelQueries(rowsQueryFilter);
 
-      // Snapshot the previous value
-      const previousData = utils.record.getByTableId.getInfiniteData({
-        tableId,
-        limit: 50,
-        viewId: selectedViewId ?? undefined
-      });
+      // Snapshot the previous value, then optimistically apply the new one
+      const rollback = snapshotCachedRows();
+      patchCachedRows(newData.recordId, withCellValue(newData.fieldId, newData.value));
 
-      // Optimistically update to the new value
-      utils.record.getByTableId.setInfiniteData(
-        { tableId, limit: 50, viewId: selectedViewId ?? undefined },
-        (old) => {
-          if (!old) return old;
-
-          return {
-            ...old,
-            pages: old.pages.map((page) => ({
-              ...page,
-              items: page.items.map((record) => {
-                if (record.id !== newData.recordId) return record;
-
-                // Find if cell exists
-                const existingCell = record.cells.find((c) => c.fieldId === newData.fieldId);
-                const field = fields?.find((f) => f.id === newData.fieldId);
-
-                if (existingCell) {
-                  // Update existing cell
-                  return {
-                    ...record,
-                    cells: record.cells.map((cell) => {
-                      if (cell.fieldId !== newData.fieldId) return cell;
-                      return { ...cell, value: newData.value, updatedAt: new Date() };
-                    }),
-                  };
-                } else if (field) {
-                  // Create new cell optimistically (for empty cells)
-                  return {
-                    ...record,
-                    cells: [
-                      ...record.cells,
-                      {
-                        id: `temp-${newData.recordId}-${newData.fieldId}`,
-                        fieldId: newData.fieldId,
-                        recordId: newData.recordId,
-                        value: newData.value,
-                        createdAt: new Date(),
-                        updatedAt: new Date(),
-                        field,
-                      },
-                    ],
-                  };
-                }
-
-                return record;
-              }),
-            })),
-          };
-        }
-      );
-
-      // Return context with previous data
-      return { previousData };
+      return { rollback };
     },
     // If mutation fails, rollback to previous value
     onError: (err, newData, context) => {
-      if (context?.previousData) {
-        utils.record.getByTableId.setInfiniteData(
-          { tableId, limit: 50, viewId: selectedViewId ?? undefined },
-          context.previousData
-        );
-      }
+      context?.rollback();
     },
   });
 
@@ -272,53 +329,7 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
       try {
         // Update the React Query cache directly without triggering mutations
         changes.forEach((change) => {
-          utils.record.getByTableId.setInfiniteData(
-            { tableId, limit: 50, viewId: selectedViewId ?? undefined },
-            (old) => {
-              if (!old) return old;
-
-              return {
-                ...old,
-                pages: old.pages.map((page) => ({
-                  ...page,
-                  items: page.items.map((record) => {
-                    if (record.id !== change.recordId) return record;
-
-                    const cell = record.cells.find((c) => c.fieldId === change.fieldId);
-                    if (cell) {
-                      // Update existing cell
-                      return {
-                        ...record,
-                        cells: record.cells.map((c) =>
-                          c.fieldId === change.fieldId ? { ...c, value: change.value } : c
-                        ),
-                      };
-                    } else {
-                      // Add new cell (for empty cells)
-                      const field = fields?.find((f) => f.id === change.fieldId);
-                      if (!field) return record;
-
-                      return {
-                        ...record,
-                        cells: [
-                          ...record.cells,
-                          {
-                            id: `temp-${change.recordId}-${change.fieldId}`,
-                            fieldId: change.fieldId,
-                            recordId: change.recordId,
-                            value: change.value,
-                            field,
-                            createdAt: new Date(),
-                            updatedAt: new Date(),
-                          },
-                        ],
-                      };
-                    }
-                  }),
-                })),
-              };
-            }
-          );
+          patchCachedRows(change.recordId, withCellValue(change.fieldId, change.value));
         });
 
         // Save to database in the background (fire and forget)
@@ -368,7 +379,7 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
       // Invalidate both views and records to refresh filtered data
       await Promise.all([
         utils.view.getByTableId.invalidate({ tableId }),
-        utils.record.getByTableId.invalidate({ tableId })
+        invalidateRows()
       ]);
       setNewFilterFieldId("");
       setNewFilterValue("");
@@ -381,7 +392,7 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
       // Invalidate both views and records to refresh filtered data
       await Promise.all([
         utils.view.getByTableId.invalidate({ tableId }),
-        utils.record.getByTableId.invalidate({ tableId })
+        invalidateRows()
       ]);
     },
   });
@@ -392,7 +403,7 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
       // Invalidate both views and records to refresh sorted data
       await Promise.all([
         utils.view.getByTableId.invalidate({ tableId }),
-        utils.record.getByTableId.invalidate({ tableId })
+        invalidateRows()
       ]);
       setNewSortFieldId("");
       setIsSortOpen(false);
@@ -404,7 +415,7 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
       // Invalidate both views and records to refresh sorted data
       await Promise.all([
         utils.view.getByTableId.invalidate({ tableId }),
-        utils.record.getByTableId.invalidate({ tableId })
+        invalidateRows()
       ]);
     },
   });
@@ -609,8 +620,7 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
       const rowData: Record<string, any> = {};
 
       for (const field of visibleFields) {
-        const cell = record.cells.find((c) => c.fieldId === field.id);
-        rowData[field.name] = cell?.value ?? null;
+        rowData[field.name] = record.cellsByFieldId.get(field.id)?.value ?? null;
       }
 
       return rowData;
@@ -624,7 +634,7 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
   }, [fields, records, currentView, table]);
 
   // Build columns for TanStack Table
-  const columns = useMemo<ColumnDef<RecordWithCells>[]>(() => {
+  const columns = useMemo<ColumnDef<RecordWithCellMap>[]>(() => {
     if (!fields) return [];
 
     // Get hidden field IDs for current view
@@ -635,13 +645,13 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
     // Filter out hidden fields
     const visibleFields = fields.filter((field) => !hiddenFieldIds.has(field.id));
 
-    const cols: ColumnDef<RecordWithCells>[] = [
+    const cols: ColumnDef<RecordWithCellMap>[] = [
       {
         id: "rowNumber",
         header: () => <div className="px-4 py-2 text-xs font-medium text-gray-500">#</div>,
         cell: ({ row }) => (
           <div className="group flex items-center justify-between px-4 py-2 text-xs text-gray-500">
-            <span>{row.index + 1}</span>
+            <span>{row.original.absIndex + 1}</span>
             <button
               onClick={() => {
                 if (confirm('Delete this record?')) {
@@ -664,10 +674,7 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
     visibleFields.forEach((field) => {
       cols.push({
         id: field.id,
-        accessorFn: (record) => {
-          const cell = record.cells.find((c) => c.fieldId === field.id);
-          return cell?.value;
-        },
+        accessorFn: (record) => record.cellsByFieldId.get(field.id)?.value,
         header: () => (
           <div className="group relative flex items-center justify-between px-4 py-2">
             {editingFieldId === field.id ? (
@@ -759,15 +766,16 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
             )}
           </div>
         ),
-        cell: ({ row, getValue, column }) => {
+        cell: ({ row, getValue, column, table }) => {
           const record = row.original;
-          const rowIndex = row.index;
+          const rowIndex = record.absIndex;
           const columnIndex = column.getIndex();
+          const meta = table.options.meta as TableMeta;
 
           // Use optimistic value if available, otherwise use database value
           const key = `${record.id}-${field.id}`;
           const dbValue = getValue();
-          const value = optimisticChanges.has(key) ? optimisticChanges.get(key) : dbValue;
+          const value = meta.optimisticChanges.has(key) ? meta.optimisticChanges.get(key) : dbValue;
 
           return (
             <EditableCell
@@ -778,9 +786,9 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
               fieldConfig={field.config}
               rowIndex={rowIndex}
               columnIndex={columnIndex}
-              isFocused={focusedCell?.rowIndex === rowIndex && focusedCell?.columnIndex === columnIndex}
-              isEditing={editingCell?.rowIndex === rowIndex && editingCell?.columnIndex === columnIndex}
-              totalRows={records.length}
+              isFocused={meta.focusedCell?.rowIndex === rowIndex && meta.focusedCell?.columnIndex === columnIndex}
+              isEditing={meta.editingCell?.rowIndex === rowIndex && meta.editingCell?.columnIndex === columnIndex}
+              totalRows={meta.totalRows}
               totalCols={visibleFields.length + 1}
               onNavigate={handleCellNavigate}
               onFocusCell={() => setFocusedCell({ rowIndex, columnIndex })}
@@ -812,19 +820,24 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
 
     return cols;
   }, [
+    // focusedCell, editingCell, optimisticChanges, and totalRows are
+    // intentionally NOT deps: they're read from table.options.meta at render
+    // time instead, so clicking/typing/scrolling doesn't rebuild every
+    // column def and force a full row-model reprocess of all loaded rows.
     fields,
     currentView,
-    focusedCell,
     editingFieldId,
     editFieldName,
     fieldMenuOpenId,
     selectedViewId,
-    records.length,
-    updateCell,
-    deleteRecord,
-    deleteField,
-    updateField,
-    hideField,
+    // Only each mutation's .mutate is used in here, and it's stable. Depending
+    // on the mutation result objects themselves (new objects every render)
+    // rebuilt every column def on every render, including every scroll frame,
+    // which in turn forced every visible row to re-render.
+    deleteRecord.mutate,
+    deleteField.mutate,
+    updateField.mutate,
+    hideField.mutate,
     handleCellNavigate
   ]);
 
@@ -832,20 +845,74 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
     data: records,
     columns,
     getCoreRowModel: getCoreRowModel(),
+    // Stable row ids, so React keys survive pages loading and evicting around them.
+    getRowId: (record) => record.id,
+    // Frequently-changing interaction state goes through meta rather than
+    // columns' closures — see TableMeta and the columns useMemo comment above.
+    meta: { focusedCell, editingCell, optimisticChanges, totalRows } satisfies TableMeta,
   });
+
+  // The table only holds loaded rows; the virtualizer works in absolute row
+  // indexes, so look rows up by position. Indexes with no entry are rows
+  // whose page hasn't arrived yet and render as placeholders.
+  const rowModel = reactTable.getRowModel();
+  const rowsByAbsIndex = useMemo(
+    () => new Map(rowModel.rows.map((row) => [row.original.absIndex, row])),
+    [rowModel]
+  );
 
   // Virtual scrolling setup
   const tableContainerRef = useRef<HTMLDivElement>(null);
 
   const rowVirtualizer = useVirtualizer({
-    count: reactTable.getRowModel().rows.length,
+    // Sized to the whole view, not just loaded rows, so the scrollbar never
+    // runs out before the data does. 100K rows * 40px = 4M px, well under
+    // browser element-height limits (~17M px in Firefox, ~33M px in Chrome).
+    count: totalRows,
     getScrollElement: () => tableContainerRef.current,
-    estimateSize: () => 40, // Estimated row height in pixels
+    estimateSize: () => ROW_HEIGHT,
     overscan: 10, // Render 10 extra rows above and below viewport for smooth scrolling
-    // Note: flushSync warning from TanStack Virtual is a known issue with React 19
-    // See: https://github.com/TanStack/virtual/issues/642
-    // This doesn't affect functionality, just logs a warning
+    // Default index-based item keys are correct here: indexes are absolute
+    // row positions, so they don't shift when pages load or evict.
   });
+
+  // Drive which pages are loaded from the rendered range, padded by
+  // PREFETCH_ROWS in both directions so scrolling either way usually lands
+  // on rows that are already cached.
+  const virtualItems = rowVirtualizer.getVirtualItems();
+  const firstRenderedRow = virtualItems[0]?.index ?? 0;
+  const lastRenderedRow = virtualItems[virtualItems.length - 1]?.index ?? 0;
+  const wantedFirstPage = Math.max(0, Math.floor((firstRenderedRow - PREFETCH_ROWS) / PAGE_SIZE));
+  const wantedLastPage = Math.floor((lastRenderedRow + PREFETCH_ROWS) / PAGE_SIZE);
+  useEffect(() => {
+    const apply = () =>
+      setPageRange((prev) =>
+        prev.first === wantedFirstPage && prev.last === wantedLastPage
+          ? prev
+          : { first: wantedFirstPage, last: wantedLastPage }
+      );
+    // Ordinary scrolling moves the range contiguously: fetch immediately.
+    const isContiguous = wantedFirstPage <= pageRange.last + 1 && wantedLastPage >= pageRange.first - 1;
+    if (isContiguous) {
+      apply();
+      return;
+    }
+    // A jump (scrollbar drag, Ctrl+End): wait for it to settle first.
+    const timer = setTimeout(apply, JUMP_SETTLE_MS);
+    return () => clearTimeout(timer);
+  }, [wantedFirstPage, wantedLastPage, pageRange]);
+
+  // A new view is a different result set: start it from the top.
+  useEffect(() => {
+    tableContainerRef.current?.scrollTo({ top: 0 });
+  }, [selectedViewId]);
+
+  // Keyboard navigation can move focus onto a row that isn't rendered (or
+  // isn't loaded yet); bring it into view so the virtualizer renders it.
+  const focusedRowIndex = focusedCell?.rowIndex;
+  useEffect(() => {
+    if (focusedRowIndex !== undefined) rowVirtualizer.scrollToIndex(focusedRowIndex, { align: "auto" });
+  }, [focusedRowIndex, rowVirtualizer]);
 
   if (!base || !table) {
     return (
@@ -856,7 +923,12 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
   }
 
   return (
-    <div className="flex min-h-screen flex-col bg-gray-50">
+    // h-screen (not min-h-screen) is load-bearing: the grid container below
+    // must be height-constrained so it scrolls itself. With only a min-height
+    // it grows to its full content height (100K rows * 40px), the window
+    // scrolls instead, and the virtualizer sees every row as "in view" and
+    // renders them all.
+    <div className="flex h-screen flex-col bg-gray-50">
       {/* Header */}
       <div className="border-b border-gray-200 bg-white">
         <div className="flex items-center justify-between px-6 py-3">
@@ -1044,14 +1116,13 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
             )}
           </div>
           <div className="flex items-center gap-2 text-sm text-gray-600">
-            {isFetching && !isFetchingNextPage && (
+            {isFetchingRows && (
               <svg className="h-4 w-4 animate-spin text-blue-600" fill="none" viewBox="0 0 24 24">
                 <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
                 <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
               </svg>
             )}
-            <span>Showing {records.length} rows</span>
-            {hasNextPage && <span className="ml-2 text-gray-400">(more available)</span>}
+            <span>{totalRows.toLocaleString()} rows</span>
           </div>
         </div>
       </div>
@@ -1333,7 +1404,7 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
       )}
 
       {/* Table Grid with Virtual Scrolling */}
-      <div ref={tableContainerRef} className="flex-1 overflow-auto bg-white">
+      <div ref={tableContainerRef} className="min-h-0 flex-1 overflow-auto bg-white">
         <div className="inline-block min-w-full">
           <table className="min-w-full border-collapse">
             <thead className="sticky top-0 z-10 bg-gray-50">
@@ -1352,7 +1423,7 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
               ))}
             </thead>
             <tbody>
-              {reactTable.getRowModel().rows.length === 0 ? (
+              {totalRowsData === 0 ? (
                 <tr>
                   <td colSpan={columns.length} className="px-6 py-12 text-center text-gray-500">
                     No records yet. Click &quot;Add row&quot; to get started.
@@ -1361,42 +1432,58 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
               ) : (
                 <>
                   {/* Spacer for rows above viewport */}
-                  {(rowVirtualizer.getVirtualItems()[0]?.start ?? 0) > 0 && (
+                  {(virtualItems[0]?.start ?? 0) > 0 && (
                     <tr>
-                      <td colSpan={columns.length} style={{ height: `${rowVirtualizer.getVirtualItems()[0]?.start ?? 0}px` }} />
+                      <td colSpan={columns.length} style={{ height: `${virtualItems[0]?.start ?? 0}px` }} />
                     </tr>
                   )}
 
                   {/* Only render visible rows */}
-                  {rowVirtualizer.getVirtualItems().map((virtualRow) => {
-                    const row = reactTable.getRowModel().rows[virtualRow.index];
-                    if (!row) return null;
+                  {virtualItems.map((virtualRow) => {
+                    const row = rowsByAbsIndex.get(virtualRow.index);
+
+                    // Page not loaded yet: hold the row's space with a
+                    // placeholder so nothing shifts when the data lands.
+                    if (!row) {
+                      return (
+                        <tr key={`placeholder-${virtualRow.index}`} style={{ height: ROW_HEIGHT }}>
+                          {reactTable.getVisibleLeafColumns().map((column) => (
+                            <td
+                              key={column.id}
+                              className="border border-gray-200 px-4"
+                              style={{ width: column.getSize() }}
+                            >
+                              {column.id === "rowNumber" ? (
+                                <span className="text-xs text-gray-400">{virtualRow.index + 1}</span>
+                              ) : (
+                                <div className="h-3 w-3/4 animate-pulse rounded bg-gray-100" />
+                              )}
+                            </td>
+                          ))}
+                        </tr>
+                      );
+                    }
 
                     return (
-                      <tr key={row.id} className="hover:bg-gray-50">
-                        {row.getVisibleCells().map((cell) => (
-                          <td
-                            key={cell.id}
-                            className="border border-gray-200"
-                            style={{ width: cell.column.getSize() }}
-                          >
-                            {flexRender(cell.column.columnDef.cell, cell.getContext())}
-                          </td>
-                        ))}
-                      </tr>
+                      <GridRowView
+                        key={row.id}
+                        row={row}
+                        columns={columns}
+                        focusedColumn={focusedCell?.rowIndex === virtualRow.index ? focusedCell.columnIndex : null}
+                        editingColumn={editingCell?.rowIndex === virtualRow.index ? editingCell.columnIndex : null}
+                        optimisticChanges={optimisticChanges}
+                        totalRows={totalRows}
+                      />
                     );
                   })}
 
                   {/* Spacer for rows below viewport */}
-                  {rowVirtualizer.getVirtualItems().length > 0 && (
+                  {virtualItems.length > 0 && (
                     <tr>
                       <td
                         colSpan={columns.length}
                         style={{
-                          height: `${
-                            rowVirtualizer.getTotalSize() -
-                            (rowVirtualizer.getVirtualItems()[rowVirtualizer.getVirtualItems().length - 1]?.end ?? 0)
-                          }px`
+                          height: `${rowVirtualizer.getTotalSize() - (virtualItems[virtualItems.length - 1]?.end ?? 0)}px`
                         }}
                       />
                     </tr>
@@ -1406,41 +1493,6 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
             </tbody>
           </table>
         </div>
-
-        {/* Auto-load more when scrolling near bottom */}
-        {hasNextPage && !isFetchingNextPage && (
-          <div
-            ref={(node) => {
-              if (node) {
-                const observer = new IntersectionObserver(
-                  (entries) => {
-                    if (entries[0]?.isIntersecting) {
-                      void fetchNextPage();
-                    }
-                  },
-                  { threshold: 0.1 }
-                );
-                observer.observe(node);
-                return () => observer.disconnect();
-              }
-            }}
-            className="border-t border-gray-200 bg-gray-50 p-4 text-center"
-          >
-            <span className="text-sm text-gray-500">Scroll down to load more...</span>
-          </div>
-        )}
-
-        {isFetchingNextPage && (
-          <div className="border-t border-gray-200 bg-gray-50 p-4 text-center">
-            <div className="flex items-center justify-center gap-2">
-              <svg className="h-4 w-4 animate-spin text-blue-600" fill="none" viewBox="0 0 24 24">
-                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-              </svg>
-              <span className="text-sm text-gray-600">Loading more rows...</span>
-            </div>
-          </div>
-        )}
       </div>
 
       {/* Create View Modal */}
@@ -1660,6 +1712,35 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
 }
 
 // Editable Cell Component
+type GridRowViewProps = {
+  row: Row<RecordWithCellMap>;
+  // The props below aren't read here: cells get them through column defs and
+  // table.options.meta at render time. They're passed only so memo re-renders
+  // this row when something it displays actually changes.
+  columns: ColumnDef<RecordWithCellMap>[];
+  focusedColumn: number | null;
+  editingColumn: number | null;
+  optimisticChanges: Map<string, unknown>;
+  totalRows: number;
+};
+
+// One loaded grid row. Memoized because the virtualizer re-renders TableView
+// on every scroll event; without this every visible cell re-rendered (and
+// re-attached its listeners) on every scroll frame. Now a frame only renders
+// rows that just scrolled into view, and a focus move only re-renders the two
+// rows it leaves and enters (focusedColumn/editingColumn are per-row slices).
+const GridRowView = memo(function GridRowView({ row }: GridRowViewProps) {
+  return (
+    <tr className="hover:bg-gray-50" style={{ height: ROW_HEIGHT }}>
+      {row.getVisibleCells().map((cell) => (
+        <td key={cell.id} className="border border-gray-200" style={{ width: cell.column.getSize() }}>
+          {flexRender(cell.column.columnDef.cell, cell.getContext())}
+        </td>
+      ))}
+    </tr>
+  );
+});
+
 function EditableCell({
   recordId,
   fieldId,

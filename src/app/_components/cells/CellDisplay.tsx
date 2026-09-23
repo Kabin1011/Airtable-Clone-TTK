@@ -3,6 +3,22 @@
 import type { FieldType } from "../../../../generated/prisma";
 import { formatFieldValue, SELECT_COLORS } from "~/lib/fieldTypes";
 
+// toLocaleDateString/toLocaleString with an options object construct a new
+// Intl.DateTimeFormat on every call, which is expensive; with date columns in
+// every visible row that dominated scroll render time. Build them once.
+const dateFormatter = new Intl.DateTimeFormat(undefined, {
+  year: "numeric",
+  month: "short",
+  day: "numeric",
+});
+const dateTimeFormatter = new Intl.DateTimeFormat(undefined, {
+  year: "numeric",
+  month: "short",
+  day: "numeric",
+  hour: "2-digit",
+  minute: "2-digit",
+});
+
 interface CellDisplayProps {
   value: any;
   fieldType: FieldType;
@@ -121,22 +137,12 @@ export function CellDisplay({ value, fieldType, fieldConfig }: CellDisplayProps)
     case "DATE":
       const date = new Date(value);
       const includeTime = fieldConfig?.includeTime ?? false;
+      // Intl formatters throw on an invalid date (toLocale* returned "Invalid Date").
+      if (Number.isNaN(date.getTime())) return <span className="text-gray-900">Invalid Date</span>;
 
       return (
         <span className="text-gray-900">
-          {includeTime
-            ? date.toLocaleString(undefined, {
-                year: "numeric",
-                month: "short",
-                day: "numeric",
-                hour: "2-digit",
-                minute: "2-digit",
-              })
-            : date.toLocaleDateString(undefined, {
-                year: "numeric",
-                month: "short",
-                day: "numeric",
-              })}
+          {(includeTime ? dateTimeFormatter : dateFormatter).format(date)}
         </span>
       );
 
