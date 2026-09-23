@@ -21,6 +21,15 @@ export function useAutoSave({ onSave, delay = 30000 }: UseAutoSaveOptions) {
   const timeoutRef = useRef<NodeJS.Timeout | null>(null);
   const isSavingRef = useRef(false);
   const isEditingRef = useRef(false); // Track if ANY cell is being edited
+  // Latest onSave, read at save time. Callers typically pass an inline
+  // function (a new identity every render); depending on it directly made
+  // every callback below change on every render, and made the unmount
+  // cleanup effect re-run (and save immediately) on every render instead of
+  // waiting for the delay.
+  const onSaveRef = useRef(onSave);
+  useEffect(() => {
+    onSaveRef.current = onSave;
+  });
 
   // Clear the existing timeout
   const clearTimer = useCallback(() => {
@@ -42,7 +51,7 @@ export function useAutoSave({ onSave, delay = 30000 }: UseAutoSaveOptions) {
     console.log(`Auto-saving ${changes.length} changes...`);
 
     try {
-      await onSave(changes);
+      await onSaveRef.current(changes);
       // Clear pending changes after successful save
       pendingChangesRef.current.clear();
       console.log('Auto-save successful!');
@@ -52,7 +61,7 @@ export function useAutoSave({ onSave, delay = 30000 }: UseAutoSaveOptions) {
     } finally {
       isSavingRef.current = false;
     }
-  }, [onSave]);
+  }, []);
 
   // Start the auto-save timer (only if not editing)
   const startTimer = useCallback(() => {

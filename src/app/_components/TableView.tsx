@@ -10,7 +10,6 @@ import {
   getCoreRowModel,
   flexRender,
   type ColumnDef,
-  type Row,
 } from "@tanstack/react-table";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import type { FieldType } from "../../../generated/prisma";
@@ -47,17 +46,16 @@ function withCellValue(fieldId: string, value: unknown) {
 // Absolute row index (position in the view's full result set) + column index.
 type CellPosition = { rowIndex: number; columnIndex: number };
 
-// Interaction state that changes on every click/keystroke/scroll-slide.
-// Passed to useReactTable as `meta` instead of being closed over by the
-// `columns` memo, so it can update every render without forcing the memo to
-// rebuild (which would force TanStack Table to reprocess every loaded row,
-// not just the one whose focus/value actually changed).
-type TableMeta = {
-  focusedCell: CellPosition | null;
-  editingCell: CellPosition | null;
-  optimisticChanges: Map<string, unknown>;
-  totalRows: number;
-};
+type GridField = RouterOutputs["field"]["getByTableId"][number];
+
+// Unsaved edits, keyed by record id then field id. Nested per record so an
+// edit replaces only that record's entry: every other row keeps the same
+// object and its memoized GridRowView skips re-rendering.
+type OptimisticChanges = Map<string, Record<string, unknown>>;
+
+// TanStack Table only renders the header now (see reactTable below), so it
+// never needs row data.
+const NO_RECORDS: RecordWithCellMap[] = [];
 
 // Rows are fetched as independent fixed-size pages keyed by page index, and
 // the virtualizer is sized to the view's full row count, so the scrollbar
@@ -111,7 +109,10 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
   const [editingCell, setEditingCell] = useState<{ rowIndex: number; columnIndex: number } | null>(null);
 
   // Local optimistic updates (for immediate UI feedback without database saves)
-  const [optimisticChanges, setOptimisticChanges] = useState<Map<string, any>>(new Map());
+  const [optimisticChanges, setOptimisticChanges] = useState<OptimisticChanges>(new Map());
+  // What the editor opens with: the typed character, "" for Backspace/Delete,
+  // or undefined to start from the cell's current value.
+  const [editSeed, setEditSeed] = useState<unknown>(undefined);
 
   // Excel import/export using dedicated hook
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -183,13 +184,14 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
   const isFetchingRows = pageQueries.some((q) => q.isFetching);
 
   // Flatten loaded pages into one array, tagging each record with its absolute
-  // row index and precomputing a fieldId -> cell Map so cell lookups
-  // (accessorFn + cell renderer, run for every visible cell on every render)
-  // are O(1). Built per page and cached by the page's data reference, so a
-  // newly loaded page or an edit in one page doesn't rebuild the others; and
-  // the flattened array keeps its identity until some page's data actually
-  // changes, so TanStack Table doesn't reprocess its row model every render.
-  const builtPagesRef = useRef(new WeakMap<GridRow[], RecordWithCellMap[]>());
+  // row index and precomputing a fieldId -> cell Map for O(1) cell lookups.
+  // Built objects are cached per raw record. React Query's structural sharing
+  // keeps unchanged records' identity across refetches and optimistic
+  // patches, so they map to the same built object and their memoized rows
+  // skip re-rendering; only records that actually changed are rebuilt.
+  // The flattened array itself keeps its identity until some page's data
+  // changes.
+  const builtRecordsRef = useRef(new WeakMap<GridRow, RecordWithCellMap>());
   const recordsRef = useRef<{ deps: unknown[]; records: RecordWithCellMap[] }>({ deps: [], records: [] });
   const recordDeps = pageIndexes.flatMap((page, i) => [page, pageQueries[i]?.data]);
   if (
@@ -201,16 +203,19 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
       records: pageIndexes.flatMap((page, i) => {
         const data = pageQueries[i]?.data;
         if (!data) return [];
-        let built = builtPagesRef.current.get(data);
-        if (!built) {
-          built = data.map((record, j) => ({
-            ...record,
-            absIndex: page * PAGE_SIZE + j,
-            cellsByFieldId: new Map(record.cells.map((c) => [c.fieldId, c])),
-          }));
-          builtPagesRef.current.set(data, built);
-        }
-        return built;
+        return data.map((record, j) => {
+          const absIndex = page * PAGE_SIZE + j;
+          let built = builtRecordsRef.current.get(record);
+          if (built?.absIndex !== absIndex) {
+            built = {
+              ...record,
+              absIndex,
+              cellsByFieldId: new Map(record.cells.map((c) => [c.fieldId, c])),
+            };
+            builtRecordsRef.current.set(record, built);
+          }
+          return built;
+        });
       }),
     };
   }
@@ -320,7 +325,7 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
   });
 
   // Global auto-save that batches multiple cell updates
-  const { trackChange, forceSave, getPendingCount, notifyEditingStart, notifyEditingEnd } = useAutoSave({
+  const { trackChange, getPendingCount, notifyEditingStart, notifyEditingEnd } = useAutoSave({
     onSave: async (changes) => {
       console.log(`Auto-saving ${changes.length} changes in background...`);
 
@@ -478,12 +483,36 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
     });
   };
 
+  // Cell edits commit/cancel through these. Stable (their deps are stable
+  // useAutoSave callbacks), so passing them to every row doesn't break the
+  // rows' memoization.
+  const commitEdit = useCallback((recordId: string, fieldId: string, value: unknown) => {
+    // Store change in local optimistic state for immediate UI feedback
+    setOptimisticChanges((prev) => {
+      const next = new Map(prev);
+      next.set(recordId, { ...prev.get(recordId), [fieldId]: value });
+      return next;
+    });
+    // Track change for batch auto-save
+    trackChange(recordId, fieldId, value);
+    setEditingCell(null);
+    notifyEditingEnd();
+  }, [trackChange, notifyEditingEnd]);
+
+  const cancelEdit = useCallback(() => {
+    setEditingCell(null);
+    notifyEditingEnd();
+  }, [notifyEditingEnd]);
+
   // Keyboard shortcuts
   const shortcuts: KeyboardShortcut[] = [
     {
       key: 'Escape',
       description: 'Close modals and panels',
       action: () => {
+        // This shortcut listens in the capture phase and stops propagation,
+        // so the cell editor never sees Escape itself; cancel the edit here.
+        if (editingCell) cancelEdit();
         setIsCreatingField(false);
         setIsCreatingView(false);
         setIsFilterOpen(false);
@@ -549,6 +578,7 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
   ];
 
   useKeyboardShortcuts(shortcuts);
+
 
   // Navigation handler - memoized to prevent recreating on every render
   const handleCellNavigate = useCallback((rowIndex: number, columnIndex: number, direction: 'up' | 'down' | 'left' | 'right' | 'tab' | 'shift-tab', totalRows: number, totalCols: number) => {
@@ -633,40 +663,22 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
     exportToExcel(exportData, visibleFields, filename);
   }, [fields, records, currentView, table]);
 
-  // Build columns for TanStack Table
+  // Fields shown in the current view, in order. Body column i + 1 is
+  // visibleFields[i]; column 0 is the row number.
+  const visibleFields = useMemo<GridField[]>(() => {
+    if (!fields) return [];
+    const hiddenFieldIds = new Set(currentView?.hiddenFields?.map((hf) => hf.fieldId) ?? []);
+    return fields.filter((field) => !hiddenFieldIds.has(field.id));
+  }, [fields, currentView]);
+
+  // Column defs for the header row. The body is rendered by GridRowView.
   const columns = useMemo<ColumnDef<RecordWithCellMap>[]>(() => {
     if (!fields) return [];
-
-    // Get hidden field IDs for current view
-    const hiddenFieldIds = new Set(
-      currentView?.hiddenFields?.map((hf) => hf.fieldId) ?? []
-    );
-
-    // Filter out hidden fields
-    const visibleFields = fields.filter((field) => !hiddenFieldIds.has(field.id));
 
     const cols: ColumnDef<RecordWithCellMap>[] = [
       {
         id: "rowNumber",
         header: () => <div className="px-4 py-2 text-xs font-medium text-gray-500">#</div>,
-        cell: ({ row }) => (
-          <div className="group flex items-center justify-between px-4 py-2 text-xs text-gray-500">
-            <span>{row.original.absIndex + 1}</span>
-            <button
-              onClick={() => {
-                if (confirm('Delete this record?')) {
-                  deleteRecord.mutate({ id: row.original.id });
-                }
-              }}
-              className="opacity-0 transition-opacity hover:text-red-600 group-hover:opacity-100"
-              title="Delete record"
-            >
-              <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-              </svg>
-            </button>
-          </div>
-        ),
         size: 60,
       },
     ];
@@ -674,7 +686,6 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
     visibleFields.forEach((field) => {
       cols.push({
         id: field.id,
-        accessorFn: (record) => record.cellsByFieldId.get(field.id)?.value,
         header: () => (
           <div className="group relative flex items-center justify-between px-4 py-2">
             {editingFieldId === field.id ? (
@@ -766,99 +777,41 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
             )}
           </div>
         ),
-        cell: ({ row, getValue, column, table }) => {
-          const record = row.original;
-          const rowIndex = record.absIndex;
-          const columnIndex = column.getIndex();
-          const meta = table.options.meta as TableMeta;
-
-          // Use optimistic value if available, otherwise use database value
-          const key = `${record.id}-${field.id}`;
-          const dbValue = getValue();
-          const value = meta.optimisticChanges.has(key) ? meta.optimisticChanges.get(key) : dbValue;
-
-          return (
-            <EditableCell
-              recordId={record.id}
-              fieldId={field.id}
-              value={value}
-              fieldType={field.type}
-              fieldConfig={field.config}
-              rowIndex={rowIndex}
-              columnIndex={columnIndex}
-              isFocused={meta.focusedCell?.rowIndex === rowIndex && meta.focusedCell?.columnIndex === columnIndex}
-              isEditing={meta.editingCell?.rowIndex === rowIndex && meta.editingCell?.columnIndex === columnIndex}
-              totalRows={meta.totalRows}
-              totalCols={visibleFields.length + 1}
-              onNavigate={handleCellNavigate}
-              onFocusCell={() => setFocusedCell({ rowIndex, columnIndex })}
-              onStartEdit={() => {
-                setFocusedCell({ rowIndex, columnIndex });
-                setEditingCell({ rowIndex, columnIndex });
-              }}
-              onStopEdit={() => setEditingCell(null)}
-              onUpdate={(newValue) => {
-                // Store change in local optimistic state for immediate UI feedback
-                const key = `${record.id}-${field.id}`;
-                setOptimisticChanges((prev) => {
-                  const next = new Map(prev);
-                  next.set(key, newValue);
-                  return next;
-                });
-                // Track change for batch auto-save
-                trackChange(record.id, field.id, newValue);
-              }}
-              onForceSave={forceSave}
-              onEditingStart={notifyEditingStart}
-              onEditingEnd={notifyEditingEnd}
-            />
-          );
-        },
         size: 200,
       });
     });
 
     return cols;
   }, [
-    // focusedCell, editingCell, optimisticChanges, and totalRows are
-    // intentionally NOT deps: they're read from table.options.meta at render
-    // time instead, so clicking/typing/scrolling doesn't rebuild every
-    // column def and force a full row-model reprocess of all loaded rows.
     fields,
-    currentView,
+    visibleFields,
     editingFieldId,
     editFieldName,
     fieldMenuOpenId,
     selectedViewId,
     // Only each mutation's .mutate is used in here, and it's stable. Depending
     // on the mutation result objects themselves (new objects every render)
-    // rebuilt every column def on every render, including every scroll frame,
-    // which in turn forced every visible row to re-render.
-    deleteRecord.mutate,
+    // rebuilt every column def on every render, including every scroll frame.
     deleteField.mutate,
     updateField.mutate,
     hideField.mutate,
-    handleCellNavigate
   ]);
 
+  // Header only. TanStack Table rebuilds every row object whenever its data
+  // changes, which would defeat GridRowView's memo on every page load or
+  // edit, so rows are rendered straight from records instead.
   const reactTable = useReactTable({
-    data: records,
+    data: NO_RECORDS,
     columns,
     getCoreRowModel: getCoreRowModel(),
-    // Stable row ids, so React keys survive pages loading and evicting around them.
-    getRowId: (record) => record.id,
-    // Frequently-changing interaction state goes through meta rather than
-    // columns' closures — see TableMeta and the columns useMemo comment above.
-    meta: { focusedCell, editingCell, optimisticChanges, totalRows } satisfies TableMeta,
   });
 
-  // The table only holds loaded rows; the virtualizer works in absolute row
-  // indexes, so look rows up by position. Indexes with no entry are rows
-  // whose page hasn't arrived yet and render as placeholders.
-  const rowModel = reactTable.getRowModel();
-  const rowsByAbsIndex = useMemo(
-    () => new Map(rowModel.rows.map((row) => [row.original.absIndex, row])),
-    [rowModel]
+  // The virtualizer works in absolute row indexes; look loaded records up by
+  // position. Indexes with no entry are rows whose page hasn't arrived yet
+  // and render as placeholders.
+  const recordsByAbsIndex = useMemo(
+    () => new Map(records.map((record) => [record.absIndex, record])),
+    [records]
   );
 
   // Virtual scrolling setup
@@ -913,6 +866,71 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
   useEffect(() => {
     if (focusedRowIndex !== undefined) rowVirtualizer.scrollToIndex(focusedRowIndex, { align: "auto" });
   }, [focusedRowIndex, rowVirtualizer]);
+
+  // One set of handlers on <tbody> for every cell, instead of listeners and
+  // callbacks in each cell (which re-attached on every render and kept cells
+  // from being memoized). Cells identify themselves with data-row/data-col.
+  const cellPositionFromEvent = (target: EventTarget): CellPosition | null => {
+    const el = (target as HTMLElement).closest<HTMLElement>("[data-col]");
+    return el ? { rowIndex: Number(el.dataset.row), columnIndex: Number(el.dataset.col) } : null;
+  };
+
+  const startEditing = (position: CellPosition, seed: unknown) => {
+    setEditSeed(seed);
+    setFocusedCell(position);
+    setEditingCell(position);
+    notifyEditingStart();
+  };
+
+  const handleGridClick = (e: React.MouseEvent) => {
+    const deleteButton = (e.target as HTMLElement).closest<HTMLElement>('[data-action="delete-row"]');
+    if (deleteButton) {
+      const recordId = deleteButton.dataset.recordId;
+      if (recordId && confirm('Delete this record?')) deleteRecord.mutate({ id: recordId });
+      return;
+    }
+    const position = cellPositionFromEvent(e.target);
+    if (position) setFocusedCell(position);
+  };
+
+  const handleGridDoubleClick = (e: React.MouseEvent) => {
+    const position = cellPositionFromEvent(e.target);
+    if (!position) return;
+    e.preventDefault();
+    startEditing(position, undefined);
+  };
+
+  const handleGridKeyDown = (e: React.KeyboardEvent) => {
+    // While editing, keys belong to the editor (its events bubble up here too).
+    if (editingCell) return;
+    const position = cellPositionFromEvent(e.target);
+    if (!position) return;
+
+    const isPrintableChar = e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey;
+    if (isPrintableChar) {
+      e.preventDefault();
+      startEditing(position, e.key);
+      return;
+    }
+
+    const direction =
+      e.key === "ArrowUp" ? "up"
+      : e.key === "ArrowDown" ? "down"
+      : e.key === "ArrowLeft" ? "left"
+      : e.key === "ArrowRight" ? "right"
+      : e.key === "Tab" ? (e.shiftKey ? "shift-tab" : "tab")
+      : null;
+    if (direction) {
+      e.preventDefault();
+      handleCellNavigate(position.rowIndex, position.columnIndex, direction, totalRows, visibleFields.length + 1);
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      startEditing(position, undefined);
+    } else if (e.key === "Backspace" || e.key === "Delete") {
+      e.preventDefault();
+      startEditing(position, "");
+    }
+  };
 
   if (!base || !table) {
     return (
@@ -1406,7 +1424,12 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
       {/* Table Grid with Virtual Scrolling */}
       <div ref={tableContainerRef} className="min-h-0 flex-1 overflow-auto bg-white">
         <div className="inline-block min-w-full">
-          <table className="min-w-full border-collapse">
+          {/* table-fixed: column widths come from the header alone. With the
+              default auto layout the browser re-measured every rendered row's
+              content to size columns, so each batch of rows scrolling in
+              forced a relayout and could make columns jitter. Fixed layout
+              only applies with a definite width, hence the explicit one. */}
+          <table className="min-w-full table-fixed border-collapse" style={{ width: reactTable.getTotalSize() }}>
             <thead className="sticky top-0 z-10 bg-gray-50">
               {reactTable.getHeaderGroups().map((headerGroup) => (
                 <tr key={headerGroup.id}>
@@ -1422,7 +1445,7 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
                 </tr>
               ))}
             </thead>
-            <tbody>
+            <tbody onClick={handleGridClick} onDoubleClick={handleGridDoubleClick} onKeyDown={handleGridKeyDown}>
               {totalRowsData === 0 ? (
                 <tr>
                   <td colSpan={columns.length} className="px-6 py-12 text-center text-gray-500">
@@ -1440,24 +1463,19 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
 
                   {/* Only render visible rows */}
                   {virtualItems.map((virtualRow) => {
-                    const row = rowsByAbsIndex.get(virtualRow.index);
+                    const record = recordsByAbsIndex.get(virtualRow.index);
 
                     // Page not loaded yet: hold the row's space with a
                     // placeholder so nothing shifts when the data lands.
-                    if (!row) {
+                    if (!record) {
                       return (
                         <tr key={`placeholder-${virtualRow.index}`} style={{ height: ROW_HEIGHT }}>
-                          {reactTable.getVisibleLeafColumns().map((column) => (
-                            <td
-                              key={column.id}
-                              className="border border-gray-200 px-4"
-                              style={{ width: column.getSize() }}
-                            >
-                              {column.id === "rowNumber" ? (
-                                <span className="text-xs text-gray-400">{virtualRow.index + 1}</span>
-                              ) : (
-                                <div className="h-3 w-3/4 animate-pulse rounded bg-gray-100" />
-                              )}
+                          <td className="border border-gray-200 px-4">
+                            <span className="text-xs text-gray-400">{virtualRow.index + 1}</span>
+                          </td>
+                          {visibleFields.map((field) => (
+                            <td key={field.id} className="border border-gray-200 px-4">
+                              <div className="h-3 w-3/4 animate-pulse rounded bg-gray-100" />
                             </td>
                           ))}
                         </tr>
@@ -1466,13 +1484,15 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
 
                     return (
                       <GridRowView
-                        key={row.id}
-                        row={row}
-                        columns={columns}
+                        key={record.id}
+                        record={record}
+                        fields={visibleFields}
                         focusedColumn={focusedCell?.rowIndex === virtualRow.index ? focusedCell.columnIndex : null}
                         editingColumn={editingCell?.rowIndex === virtualRow.index ? editingCell.columnIndex : null}
-                        optimisticChanges={optimisticChanges}
-                        totalRows={totalRows}
+                        editSeed={editingCell?.rowIndex === virtualRow.index ? editSeed : undefined}
+                        optimistic={optimisticChanges.get(record.id)}
+                        onCommitEdit={commitEdit}
+                        onCancelEdit={cancelEdit}
                       />
                     );
                   })}
@@ -1713,76 +1733,105 @@ export function TableView({ baseId, tableId }: { baseId: string; tableId: string
 
 // Editable Cell Component
 type GridRowViewProps = {
-  row: Row<RecordWithCellMap>;
-  // The props below aren't read here: cells get them through column defs and
-  // table.options.meta at render time. They're passed only so memo re-renders
-  // this row when something it displays actually changes.
-  columns: ColumnDef<RecordWithCellMap>[];
+  record: RecordWithCellMap;
+  fields: GridField[];
+  // Per-row slices of grid-wide state (null/undefined for rows they don't
+  // touch), so memo re-renders only the rows a change actually affects.
   focusedColumn: number | null;
   editingColumn: number | null;
-  optimisticChanges: Map<string, unknown>;
-  totalRows: number;
+  editSeed: unknown;
+  optimistic: Record<string, unknown> | undefined;
+  onCommitEdit: (recordId: string, fieldId: string, value: unknown) => void;
+  onCancelEdit: () => void;
 };
 
 // One loaded grid row. Memoized because the virtualizer re-renders TableView
-// on every scroll event; without this every visible cell re-rendered (and
-// re-attached its listeners) on every scroll frame. Now a frame only renders
-// rows that just scrolled into view, and a focus move only re-renders the two
-// rows it leaves and enters (focusedColumn/editingColumn are per-row slices).
-const GridRowView = memo(function GridRowView({ row }: GridRowViewProps) {
+// on every scroll event: a scroll frame renders only rows that just came into
+// view, moving focus re-renders just the two rows involved, and committing an
+// edit re-renders just the edited row.
+const GridRowView = memo(function GridRowView({
+  record,
+  fields,
+  focusedColumn,
+  editingColumn,
+  editSeed,
+  optimistic,
+  onCommitEdit,
+  onCancelEdit,
+}: GridRowViewProps) {
   return (
     <tr className="hover:bg-gray-50" style={{ height: ROW_HEIGHT }}>
-      {row.getVisibleCells().map((cell) => (
-        <td key={cell.id} className="border border-gray-200" style={{ width: cell.column.getSize() }}>
-          {flexRender(cell.column.columnDef.cell, cell.getContext())}
-        </td>
-      ))}
+      <td className="border border-gray-200">
+        <div className="group flex items-center justify-between px-4 py-2 text-xs text-gray-500">
+          <span>{record.absIndex + 1}</span>
+          {/* Handled by TableView's delegated click handler */}
+          <button
+            data-action="delete-row"
+            data-record-id={record.id}
+            className="opacity-0 transition-opacity hover:text-red-600 group-hover:opacity-100"
+            title="Delete record"
+          >
+            <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+            </svg>
+          </button>
+        </div>
+      </td>
+      {fields.map((field, i) => {
+        const columnIndex = i + 1;
+        const isEditing = editingColumn === columnIndex;
+        // Use optimistic value if available, otherwise use database value
+        const value =
+          optimistic && field.id in optimistic ? optimistic[field.id] : record.cellsByFieldId.get(field.id)?.value;
+        return (
+          <td key={field.id} className="border border-gray-200">
+            <GridCellView
+              recordId={record.id}
+              field={field}
+              value={value}
+              rowIndex={record.absIndex}
+              columnIndex={columnIndex}
+              isFocused={focusedColumn === columnIndex}
+              isEditing={isEditing}
+              editSeed={isEditing ? editSeed : undefined}
+              onCommitEdit={onCommitEdit}
+              onCancelEdit={onCancelEdit}
+            />
+          </td>
+        );
+      })}
     </tr>
   );
 });
 
-function EditableCell({
-  recordId,
-  fieldId,
-  value,
-  fieldType,
-  fieldConfig,
-  rowIndex,
-  columnIndex,
-  isFocused,
-  isEditing,
-  totalRows,
-  totalCols,
-  onNavigate,
-  onFocusCell,
-  onStartEdit,
-  onStopEdit,
-  onUpdate,
-  onForceSave,
-  onEditingStart,
-  onEditingEnd,
-}: {
+type GridCellViewProps = {
   recordId: string;
-  fieldId: string;
-  value: any;
-  fieldType: FieldType;
-  fieldConfig?: any;
+  field: GridField;
+  value: unknown;
   rowIndex: number;
   columnIndex: number;
   isFocused: boolean;
   isEditing: boolean;
-  totalRows: number;
-  totalCols: number;
-  onNavigate: (rowIndex: number, columnIndex: number, direction: 'up' | 'down' | 'left' | 'right' | 'tab' | 'shift-tab', totalRows: number, totalCols: number) => void;
-  onFocusCell: () => void;
-  onStartEdit: () => void;
-  onStopEdit: () => void;
-  onUpdate: (value: any) => void;
-  onForceSave?: () => Promise<void>;
-  onEditingStart?: () => void;
-  onEditingEnd?: () => void;
-}) {
-  const [editInitialValue, setEditInitialValue] = useState<any>(undefined);
+  editSeed: unknown;
+  onCommitEdit: (recordId: string, fieldId: string, value: unknown) => void;
+  onCancelEdit: () => void;
+};
+
+// A single cell: a lightweight display by default; only the one cell being
+// edited mounts a CellEditor. Clicks and keys are handled by TableView's
+// delegated <tbody> handlers, found via data-row/data-col.
+const GridCellView = memo(function GridCellView({
+  recordId,
+  field,
+  value,
+  rowIndex,
+  columnIndex,
+  isFocused,
+  isEditing,
+  editSeed,
+  onCommitEdit,
+  onCancelEdit,
+}: GridCellViewProps) {
   const cellRef = useRef<HTMLDivElement>(null);
 
   // Auto-focus cell when it becomes focused programmatically
@@ -1792,134 +1841,16 @@ function EditableCell({
     }
   }, [isFocused, isEditing]);
 
-  // Set up native click and double-click event listeners
-  useEffect(() => {
-    const element = cellRef.current;
-    if (!element) return;
-
-    let clickTimeout: NodeJS.Timeout | null = null;
-
-    const handleNativeClick = (e: MouseEvent) => {
-      console.log('NATIVE CLICK');
-      if (isEditing) return;
-
-      // Clear any existing timeout
-      if (clickTimeout) {
-        clearTimeout(clickTimeout);
-      }
-
-      // Wait 250ms to see if a double-click follows
-      clickTimeout = setTimeout(() => {
-        console.log('EXECUTING SINGLE CLICK ACTION');
-        onFocusCell();
-        clickTimeout = null;
-      }, 250);
-    };
-
-    const handleNativeDoubleClick = (e: MouseEvent) => {
-      console.log('NATIVE DOUBLE CLICK EVENT!!!');
-      if (isEditing) return;
-      e.preventDefault();
-
-      // Cancel the single-click timeout
-      if (clickTimeout) {
-        clearTimeout(clickTimeout);
-        clickTimeout = null;
-      }
-
-      setEditInitialValue(undefined);
-      onStartEdit();
-      if (onEditingStart) onEditingStart();
-    };
-
-    element.addEventListener('click', handleNativeClick);
-    element.addEventListener('dblclick', handleNativeDoubleClick);
-
-    return () => {
-      if (clickTimeout) clearTimeout(clickTimeout);
-      element.removeEventListener('click', handleNativeClick);
-      element.removeEventListener('dblclick', handleNativeDoubleClick);
-    };
-  }, [isEditing, onFocusCell, onStartEdit, onEditingStart]);
-
-
-  const handleSave = useCallback(async (newValue: any) => {
-    onUpdate(newValue);
-    onStopEdit();
-    if (onEditingEnd) {
-      onEditingEnd();
-    }
-  }, [onUpdate, onStopEdit, onEditingEnd]);
-
-  const handleCancel = useCallback(() => {
-    onStopEdit();
-    if (onEditingEnd) {
-      onEditingEnd();
-    }
-  }, [onStopEdit, onEditingEnd]);
-
-  const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
-    if (isEditing) return;
-
-    const isPrintableChar = e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey;
-
-    if (isPrintableChar) {
-      e.preventDefault();
-      setEditInitialValue(e.key);
-      onStartEdit();
-      if (onEditingStart) onEditingStart();
-      return;
-    }
-
-    switch (e.key) {
-      case 'ArrowUp':
-        e.preventDefault();
-        onNavigate(rowIndex, columnIndex, 'up', totalRows, totalCols);
-        break;
-      case 'ArrowDown':
-        e.preventDefault();
-        onNavigate(rowIndex, columnIndex, 'down', totalRows, totalCols);
-        break;
-      case 'ArrowLeft':
-        e.preventDefault();
-        onNavigate(rowIndex, columnIndex, 'left', totalRows, totalCols);
-        break;
-      case 'ArrowRight':
-        e.preventDefault();
-        onNavigate(rowIndex, columnIndex, 'right', totalRows, totalCols);
-        break;
-      case 'Tab':
-        e.preventDefault();
-        onNavigate(rowIndex, columnIndex, e.shiftKey ? 'shift-tab' : 'tab', totalRows, totalCols);
-        break;
-      case 'Enter':
-        e.preventDefault();
-        setEditInitialValue(undefined);
-        onStartEdit();
-        if (onEditingStart) onEditingStart();
-        break;
-      case 'Backspace':
-      case 'Delete':
-        e.preventDefault();
-        setEditInitialValue('');
-        onStartEdit();
-        if (onEditingStart) onEditingStart();
-        break;
-    }
-  }, [isEditing, onNavigate, rowIndex, columnIndex, totalRows, totalCols, onStartEdit, onEditingStart]);
-
   if (isEditing) {
-    // Use editInitialValue if set (when user typed), otherwise use current value
-    const editorValue = editInitialValue !== undefined ? editInitialValue : value;
-
     return (
       <div className="min-h-[40px] px-4 py-2">
         <CellEditor
-          value={editorValue}
-          fieldType={fieldType}
-          fieldConfig={fieldConfig}
-          onSave={handleSave}
-          onCancel={handleCancel}
+          // Use the seed if set (the user typed a key), otherwise the current value
+          value={editSeed !== undefined ? editSeed : value}
+          fieldType={field.type}
+          fieldConfig={field.config}
+          onSave={(newValue) => onCommitEdit(recordId, field.id, newValue)}
+          onCancel={onCancelEdit}
         />
       </div>
     );
@@ -1928,16 +1859,18 @@ function EditableCell({
   return (
     <div
       ref={cellRef}
-      tabIndex={0}
-      onKeyDown={handleKeyDown}
+      data-row={rowIndex}
+      data-col={columnIndex}
+      // Roving tabindex: only the focused cell is in the tab order.
+      tabIndex={isFocused ? 0 : -1}
       className={`min-h-[40px] cursor-cell px-4 py-2 hover:bg-blue-50 focus:outline-none ${
         isFocused ? 'ring-2 ring-blue-500 ring-inset' : ''
       }`}
       style={{ userSelect: 'none' }}
     >
       <div className="pointer-events-none">
-        <CellDisplay value={value} fieldType={fieldType} fieldConfig={fieldConfig} />
+        <CellDisplay value={value} fieldType={field.type} fieldConfig={field.config} />
       </div>
     </div>
   );
-}
+});
